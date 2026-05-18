@@ -1,0 +1,61 @@
+# Number of controller replicas. Use 1; leader election handles HA.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/cgoolsby/omni-gitops-controller
+  pullPolicy: IfNotPresent
+  # Overrides the image tag. Defaults to Chart.appVersion.
+  tag: ""
+
+# Namespace where the controller is deployed.
+namespace: omni-gitops-system
+
+# Namespace where cluster kubeconfig Secrets are written.
+# Set to "argocd" and enable argoCDClusters if using ArgoCD.
+kubeconfigNamespace: flux-system
+
+# When true, writes kubeconfig Secrets in ArgoCD cluster Secret format.
+argoCDClusters: false
+
+# Enable leader election. Always true in production.
+leaderElect: true
+
+# Omni connection settings.
+# Provide credentials either via existingSecret or via omni.endpoint/omni.token.
+omni:
+  # Omni HTTPS URL, e.g. "https://omni.example.com"
+  endpoint: ""
+  # Service account token from `omnictl serviceaccount create`
+  token: ""
+  # Use an existing Secret instead of creating one from omni.endpoint/omni.token.
+  # Secret must have keys: endpoint, serviceAccountToken
+  existingSecret: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 32Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]

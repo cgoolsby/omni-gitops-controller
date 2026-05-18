@@ -1,0 +1,20 @@
+# Deploy with --argocd-clusters=true --kubeconfig-namespace=argocd
+# The controller writes a cluster Secret to the argocd namespace with
+# the argocd.argoproj.io/secret-type=cluster label.
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: argocd-managed-cluster
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 3
+    machineSelector:
+      matchLabels: {}
+  workers:
+    - name: workers
+      replicas: 2
+      machineSelector:
+        matchLabels: {}

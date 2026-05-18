@@ -1,0 +1,422 @@
+# omni-gitops-controller
+
+A Kubernetes operator that bridges [Siderolabs Omni](https://omni.siderolabs.com)
+with [Flux CD](https://fluxcd.io) (and [ArgoCD](https://argoproj.github.io/cd/)).
+
+[![Go Report Card](https://goreportcard.com/badge/github.com/cgoolsby/omni-gitops-controller)](https://goreportcard.com/report/github.com/cgoolsby/omni-gitops-controller)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
+---
+
+## What It Does
+
+When you run self-hosted Omni, there is no declarative, GitOps-friendly way to provision
+Talos clusters and have them automatically available to Flux for workload reconciliation.
+You either provision clusters by hand through the Omni UI, or you write custom tooling to
+call Omni's API and then separately distribute kubeconfigs to your GitOps tooling. Neither
+approach scales, and neither is reproducible from a Git repo.
+
+`omni-gitops-controller` solves this by introducing a single `OmniCluster` custom resource.
+You declare the desired cluster — Kubernetes version, Talos version, machine selectors, and
+optional config patches — in your GitOps repository. Flux applies it to your management
+cluster, and the controller takes over: it calls Omni's native COSI gRPC API to create the
+`Cluster`, `MachineSet`, `MachineSetNode`, and `ConfigPatch` resources, allocating machines
+from Omni's inventory pool using the label selectors you specify.
+
+Once the cluster is running, the controller retrieves the kubeconfig from Omni and writes it
+as a Kubernetes `Secret` into the namespace of your choice (default: `flux-system`). Flux can
+immediately target the new cluster using a `Kustomization` with a `kubeConfig.secretRef`
+pointing at that secret — no manual steps, no out-of-band credential distribution.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Management Cluster (runs omni-gitops-controller)            │
+│                                                              │
+│  Git Repo ──Flux──▶ OmniCluster CR                          │
+│                           │                                  │
+│                    omni-gitops-controller                    │
+│                           │                                  │
+│              ┌────────────┴────────────┐                    │
+│              ▼                         ▼                    │
+│        Omni COSI API            flux-system/                │
+│    (Cluster, MachineSet,    <name>-kubeconfig Secret         │
+│     MachineSetNode,                   │                     │
+│     ConfigPatch)                      │                     │
+│              │                        │                     │
+│              ▼                        ▼                     │
+│       Talos machines            Flux targets                │
+│       provision &               child cluster ─────────────▶│
+│       join cluster              (remote apply)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The controller runs entirely on the management cluster. It holds no state of its own —
+all cluster state lives in Omni (authoritative) and in the `OmniCluster` status subresource.
+Deletion is handled via a finalizer: the controller tears down Omni resources in dependency
+order (MachineSetNodes → MachineSets → Cluster) before the CR is removed, preventing orphaned
+machines in Omni.
+
+---
+
+## Why Not CAPI?
+
+- **Complexity:** CAPI requires 3–5 separate controllers (core, bootstrap, infrastructure,
+  control-plane) and a hierarchy of CRDs (`Cluster`, `Machine`, `MachineSet`,
+  `BootstrapConfig`, `InfrastructureMachine`, etc.). This controller is a single binary,
+  one CRD, and ~600 lines of Go.
+- **No native Omni backend:** Using CAPI with Talos requires `cluster-api-provider-talos`,
+  which provisions machines directly via `talosctl`. It bypasses Omni entirely, so Omni is
+  not the source of truth for machine inventory or lifecycle.
+- **Protocol alignment:** This controller speaks Omni's native COSI gRPC protocol. Omni
+  remains authoritative for machine registration, labeling, OS upgrades, and health
+  monitoring. The controller is an orchestration layer on top of Omni, not a replacement.
+- **Operational simplicity:** One `helm install` or `kubectl apply -k`. No provider
+  infrastructure, no bootstrap pivot, no CAPI management cluster bootstrap sequence.
+- **Choose CAPI** if you need portability across infrastructure providers (AWS, Azure, GCP,
+  vSphere). **Choose this controller** if Omni is your platform and you want a minimal,
+  Omni-native GitOps integration.
+
+---
+
+## Prerequisites
+
+- A Kubernetes cluster to run the controller on (the "management cluster")
+- [Siderolabs Omni](https://omni.siderolabs.com) (self-hosted), reachable from the
+  management cluster
+- An Omni service account token (`omnictl serviceaccount create`)
+- Flux CD installed on the management cluster (for the GitOps workflow)
+- Physical or virtual machines already registered in Omni
+
+---
+
+## Quick Start
+
+### 1. Get your service account token
+
+```bash
+omnictl serviceaccount create flux-controller \
+  --use-user-role=true \
+  --role=Admin
+```
+
+Copy the base64-encoded key from the output.
+
+### 2. Install the CRD and controller
+
+**Using Helm (recommended):**
+
+```bash
+helm install omni-gitops-controller \
+  oci://ghcr.io/cgoolsby/charts/omni-gitops-controller \
+  --namespace omni-gitops-system --create-namespace \
+  --set omni.endpoint=https://omni.example.com \
+  --set omni.token=<your-service-account-token>
+```
+
+To use an existing Secret instead of passing the token inline:
+
+```bash
+# Secret must have keys: endpoint, serviceAccountToken
+kubectl create secret generic omni-credentials \
+  --namespace omni-gitops-system \
+  --from-literal=endpoint=https://omni.example.com \
+  --from-literal=serviceAccountToken=<your-service-account-token>
+
+helm install omni-gitops-controller \
+  oci://ghcr.io/cgoolsby/charts/omni-gitops-controller \
+  --namespace omni-gitops-system --create-namespace \
+  --set omni.existingSecret=omni-credentials
+```
+
+**Using Kustomize:**
+
+```bash
+# Create the credentials secret first
+kubectl create secret generic omni-credentials \
+  --namespace omni-gitops-system \
+  --from-literal=endpoint=https://omni.example.com \
+  --from-literal=serviceAccountToken=<your-service-account-token>
+
+kubectl apply -k https://github.com/cgoolsby/omni-gitops-controller/config/default
+```
+
+### 3. Declare your first cluster
+
+```yaml
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: my-cluster
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 1
+    machineSelector:
+      matchLabels: {}   # empty = any available machine
+```
+
+### 4. Watch it provision
+
+```bash
+kubectl get omniclusters -n omni-gitops-system -w
+# NAME         K8S      TALOS    CP   READY   PHASE
+# my-cluster   1.31.0   v1.9.0   1    false   ScalingUp
+# my-cluster   1.31.0   v1.9.0   1    true    Running
+```
+
+Once `READY=true`, the kubeconfig is written to `flux-system/my-cluster-kubeconfig`.
+Flux can immediately target the cluster using a `Kustomization` with
+`spec.kubeConfig.secretRef.name: my-cluster-kubeconfig`.
+
+---
+
+## OmniCluster API Reference
+
+### Spec Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `spec.kubernetesVersion` | `string` | yes | — | Target Kubernetes version, e.g. `"1.31.0"`. Do not include the `v` prefix. |
+| `spec.talosVersion` | `string` | yes | — | Target Talos Linux version, e.g. `"v1.9.0"`. Must include the `v` prefix. |
+| `spec.controlPlane` | `MachineSetSpec` | yes | — | Describes the control-plane machine set. |
+| `spec.controlPlane.replicas` | `int32` | no | `1` | Number of control-plane machines. Use `1` or an odd number ≥ 3 for etcd quorum. |
+| `spec.controlPlane.machineSelector` | `LabelSelector` | yes | — | Selects available Omni machines by label. Empty `matchLabels: {}` matches any available machine. |
+| `spec.controlPlane.configPatches[]` | `[]ConfigPatch` | no | — | Talos machine config patches applied to every control-plane machine. |
+| `spec.controlPlane.configPatches[].name` | `string` | yes | — | Unique identifier for this patch within the machine set. |
+| `spec.controlPlane.configPatches[].inline` | `JSON` | yes | — | Patch content in Talos machine config YAML/JSON format. |
+| `spec.workers[]` | `[]WorkerMachineSetSpec` | no | — | Additional worker machine sets. Omit for single-node clusters. |
+| `spec.workers[].name` | `string` | yes | — | Identifies the worker set. Becomes the Omni MachineSet suffix: `<cluster>-<name>`. |
+| `spec.workers[].replicas` | `int32` | no | `1` | Number of worker machines in this set. |
+| `spec.workers[].machineSelector` | `LabelSelector` | yes | — | Selects available machines for this worker set. |
+| `spec.workers[].configPatches[]` | `[]ConfigPatch` | no | — | Config patches applied to every machine in this worker set. |
+
+### Status Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status.phase` | `string` | Mirrors the Omni ClusterStatus phase: `ScalingUp`, `Running`, `ScalingDown`, `Destroying`, `Failed`. |
+| `status.ready` | `bool` | `true` when Omni reports the cluster as `Running` and the Kubernetes API is reachable. |
+| `status.allocatedMachines` | `map[string][]string` | Machine UUIDs bound to this cluster, keyed by MachineSet ID. Used to detect drift on re-reconcile. |
+| `status.failureReason` | `string` | Short machine-readable token when `phase` is `Failed`, e.g. `EnsureClusterFailed`. |
+| `status.failureMessage` | `string` | Human-readable error description when `phase` is `Failed`. |
+| `status.conditions[]` | `[]metav1.Condition` | Standard Kubernetes condition set. Condition types include `Ready`, `ClusterProvisioned`, `MachinesAllocated`, `KubeconfigWritten`. |
+
+---
+
+## Machine Label Selectors
+
+Omni automatically applies labels to registered machines under the `omni.sidero.dev/` prefix.
+Use these labels in `machineSelector.matchLabels` to target specific hardware.
+
+| Label | Example value | Description |
+|-------|--------------|-------------|
+| `omni.sidero.dev/available` | `""` | Set when a machine is not currently assigned to any cluster. **You do not need to include this** — the controller always adds it to every allocation query. |
+| `omni.sidero.dev/mem` | `"32768"` | Total RAM in MiB. |
+| `omni.sidero.dev/cpu` | `"16"` | Logical CPU count. |
+| `omni.sidero.dev/platform` | `"metal"` | Platform type (`metal`, `aws`, `gcp`, etc.). |
+
+**Example: select bare-metal machines with 64 GiB RAM for control-plane, 32 GiB for workers:**
+
+```yaml
+spec:
+  controlPlane:
+    replicas: 3
+    machineSelector:
+      matchLabels:
+        omni.sidero.dev/platform: metal
+        omni.sidero.dev/mem: "65536"
+  workers:
+    - name: general
+      replicas: 3
+      machineSelector:
+        matchLabels:
+          omni.sidero.dev/platform: metal
+          omni.sidero.dev/mem: "32768"
+```
+
+The controller automatically appends `omni.sidero.dev/available` to every machine query —
+you never need to include it in your selector.
+
+---
+
+## Controller Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kubeconfig-namespace` | `flux-system` | Namespace where cluster kubeconfig Secrets are written. |
+| `--argocd-clusters` | `false` | Write Secrets in ArgoCD cluster Secret format (adds `argocd.argoproj.io/secret-type: cluster` label and ArgoCD-specific data keys). |
+| `--leader-elect` | `false` | Enable leader election for high-availability deployments. Always enable in production. |
+| `--metrics-bind-address` | `:8080` | Address for the Prometheus metrics endpoint. |
+| `--health-probe-bind-address` | `:8081` | Address for liveness and readiness probes. |
+
+**Required environment variables:**
+
+| Variable | Description |
+|----------|-------------|
+| `OMNI_ENDPOINT` | Omni HTTPS URL, e.g. `https://omni.example.com`. |
+| `OMNI_SERVICE_ACCOUNT_TOKEN` | Base64-encoded service account token from `omnictl serviceaccount create`. |
+
+---
+
+## Flux Integration
+
+After an `OmniCluster` reaches `Ready=true`, the controller writes the kubeconfig to
+`<kubeconfig-namespace>/<cluster-name>-kubeconfig`. Point one or more Flux `Kustomization`
+resources at the secret to deploy workloads onto the new cluster:
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-cluster-global
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/my-cluster/global
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  kubeConfig:
+    secretRef:
+      name: my-cluster-kubeconfig   # written by omni-gitops-controller
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: my-cluster-system
+  namespace: flux-system
+spec:
+  interval: 10m
+  path: ./clusters/my-cluster/system
+  prune: true
+  dependsOn:
+    - name: my-cluster-global
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  kubeConfig:
+    secretRef:
+      name: my-cluster-kubeconfig
+```
+
+See [`examples/flux-kustomization.yaml`](examples/flux-kustomization.yaml) for the full
+layered example.
+
+---
+
+## ArgoCD Integration
+
+Start the controller with `--argocd-clusters=true` and `--kubeconfig-namespace=argocd`.
+Instead of writing a raw kubeconfig Secret, the controller writes a Secret in ArgoCD cluster
+format:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: my-cluster
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: cluster
+type: Opaque
+data:
+  name: <base64 cluster name>
+  server: <base64 API server URL>
+  config: <base64 JSON ArgoCD cluster config with bearerToken>
+```
+
+ArgoCD watches for Secrets with the `argocd.argoproj.io/secret-type: cluster` label in its
+namespace and automatically registers the cluster. No manual `argocd cluster add` required.
+
+**Helm install for ArgoCD:**
+
+```bash
+helm install omni-gitops-controller \
+  oci://ghcr.io/cgoolsby/charts/omni-gitops-controller \
+  --namespace omni-gitops-system --create-namespace \
+  --set omni.endpoint=https://omni.example.com \
+  --set omni.token=<token> \
+  --set kubeconfigNamespace=argocd \
+  --set argoCDClusters=true
+```
+
+See [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) for a complete
+`OmniCluster` example targeting ArgoCD.
+
+---
+
+## Examples
+
+| File | Description |
+|------|-------------|
+| [`examples/single-node.yaml`](examples/single-node.yaml) | Single control-plane node, no workers. |
+| [`examples/ha-control-plane.yaml`](examples/ha-control-plane.yaml) | Three-node HA control plane + worker pool, selected by RAM label. |
+| [`examples/with-config-patches.yaml`](examples/with-config-patches.yaml) | Config patches for KubePrism, sysctl tuning, and GPU kernel modules. |
+| [`examples/flux-kustomization.yaml`](examples/flux-kustomization.yaml) | Flux `Kustomization` resources targeting a provisioned cluster. |
+| [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) | `OmniCluster` for use with `--argocd-clusters`. |
+
+---
+
+## Troubleshooting
+
+**`EnsureClusterFailed`: Omni endpoint unreachable**
+
+The controller cannot reach the Omni API. Check the `OMNI_ENDPOINT` environment variable and
+verify that the management cluster can route HTTPS traffic to Omni. If you use a self-signed
+CA, the controller's Pod must trust it — mount the CA into the container and set
+`SSL_CERT_FILE` or `SSL_CERT_DIR`.
+
+**`AllocateCPMachinesFailed: not enough available machines`**
+
+No machines in Omni match the `machineSelector` labels, or all matching machines are already
+allocated to other clusters. Run `omnictl get machines` to inspect available machines and
+their labels. Check that `omni.sidero.dev/available` is set on the machines you expect to
+be free.
+
+**`EnsureKubeconfigFailed`: kubeconfig fetch failed**
+
+The Omni service account lacks permission to retrieve the cluster's kubeconfig. In the Omni
+UI, verify that the service account was created with `--role=Admin` or at minimum has cluster
+access for the target cluster.
+
+**HelmRelease stalled after `OmniCluster` delete**
+
+The controller's finalizer blocks CR deletion until all Omni resources are torn down. Omni
+tears down nodes in order (MachineSetNodes → MachineSets → Cluster), which can take 1–2
+minutes per node. Check controller logs for progress:
+
+```bash
+kubectl logs -n omni-gitops-system deploy/omni-gitops-controller -f
+```
+
+If Omni is unreachable and you need to force-remove the CR, manually patch out the finalizer:
+
+```bash
+kubectl patch omnicluster <name> -n omni-gitops-system \
+  -p '{"metadata":{"finalizers":[]}}' --type=merge
+```
+
+This will leave Omni resources orphaned — clean them up manually in the Omni UI.
+
+---
+
+## Contributing
+
+1. Fork the repository and clone it locally.
+2. Build and verify: `go build ./...` and `go vet ./...` (requires Go 1.22+).
+3. Make your changes. Keep diffs surgical — touch only what the change requires.
+4. Open a pull request against `main` on [GitHub Issues](https://github.com/cgoolsby/omni-gitops-controller/issues).
+
+---
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

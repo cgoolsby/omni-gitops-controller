@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: omni-gitops-controller
+rules:
+  # OmniCluster CRD management
+  - apiGroups: ["omni.gitops.dev"]
+    resources: ["omniclusters"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["omni.gitops.dev"]
+    resources: ["omniclusters/status", "omniclusters/finalizers"]
+    verbs: ["get", "update", "patch"]
+  # Kubeconfig Secrets
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+  # Leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]

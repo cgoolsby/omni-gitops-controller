@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omni-gitops-controller
+  namespace: omni-gitops-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: omni-gitops-controller
+  template:
+    metadata:
+      labels:
+        app: omni-gitops-controller
+    spec:
+      serviceAccountName: omni-gitops-controller
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/cgoolsby/omni-gitops-controller:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=true
+            - --kubeconfig-namespace=flux-system
+          env:
+            - name: OMNI_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: omni-credentials
+                  key: endpoint
+            - name: OMNI_SERVICE_ACCOUNT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: omni-credentials
+                  key: serviceAccountToken
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,12 @@
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: sample-cluster
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 1
+    machineSelector:
+      matchLabels: {}   # Selects any available machine. Add labels to constrain.

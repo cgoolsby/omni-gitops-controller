@@ -1,0 +1,47 @@
+# OmniCluster with Talos machine config patches.
+# Patches are applied to every machine in the set they are declared on.
+# The inline patch format is the same as Talos machine config YAML.
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: patched-cluster-example
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 1
+    machineSelector:
+      matchLabels: {}
+    configPatches:
+      # Patch 1: Enable KubePrism (in-cluster kube-apiserver load balancer).
+      - name: kubePrism
+        inline:
+          machine:
+            features:
+              kubePrism:
+                enabled: true
+                port: 7445
+      # Patch 2: Tune inotify limits for workload-heavy nodes.
+      - name: inotify-tuning
+        inline:
+          machine:
+            sysctls:
+              fs.inotify.max_user_instances: "8192"
+              fs.inotify.max_user_watches: "524288"
+  workers:
+    - name: gpu
+      replicas: 1
+      machineSelector:
+        matchLabels:
+          omni.sidero.dev/platform: metal
+      configPatches:
+        # Patch specific to GPU worker nodes.
+        - name: gpu-kernel-modules
+          inline:
+            machine:
+              kernel:
+                modules:
+                  - name: nvidia
+                  - name: nvidia_uvm
+                  - name: nvidia_drm

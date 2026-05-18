@@ -1,0 +1,37 @@
+omni-gitops-controller has been deployed.
+
+1. Create (or verify) the Omni credentials secret:
+
+   kubectl create secret generic omni-credentials \
+     --namespace {{ .Values.namespace }} \
+     --from-literal=endpoint=https://<your-omni-endpoint> \
+     --from-literal=serviceAccountToken=<your-service-account-token>
+
+   (Omit this step if you set omni.existingSecret in values.yaml.)
+
+2. Create an OmniCluster to provision your first cluster:
+
+   kubectl apply -f - <<EOF
+   apiVersion: omni.gitops.dev/v1alpha1
+   kind: OmniCluster
+   metadata:
+     name: my-cluster
+     namespace: {{ .Values.namespace }}
+   spec:
+     kubernetesVersion: "1.31.0"
+     talosVersion: "v1.9.0"
+     controlPlane:
+       replicas: 1
+       machineSelector:
+         matchLabels: {}
+   EOF
+
+3. Watch the cluster provision:
+
+   kubectl get omniclusters -n {{ .Values.namespace }} -w
+
+4. Once Ready=true, the kubeconfig is available in:
+
+   kubectl get secret my-cluster-kubeconfig \
+     -n {{ .Values.kubeconfigNamespace }} \
+     -o jsonpath='{.data.value}' | base64 -d > /tmp/my-cluster.kubeconfig

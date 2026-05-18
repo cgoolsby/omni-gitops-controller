@@ -1,0 +1,22 @@
+# Three-node HA control plane + worker pool.
+# Machines are selected by the omni.sidero.dev/mem label (RAM in MiB).
+# Adjust the label values to match your hardware inventory.
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: ha-cluster-example
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 3
+    machineSelector:
+      matchLabels:
+        omni.sidero.dev/mem: "65536"    # 64 GiB machines for control plane
+  workers:
+    - name: general
+      replicas: 3
+      machineSelector:
+        matchLabels:
+          omni.sidero.dev/mem: "32768"  # 32 GiB machines for workers

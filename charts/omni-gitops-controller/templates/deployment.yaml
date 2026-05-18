@@ -14,6 +14,10 @@ spec:
         app: {{ include "omni-gitops-controller.name" . }}
     spec:
       serviceAccountName: {{ include "omni-gitops-controller.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -36,7 +40,15 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "omni-gitops-controller.credentialsSecret" . }}
-                  key: serviceAccountToken
+                  key: token
+          {{- if .Values.omni.caCert }}
+            - name: SSL_CERT_FILE
+              value: /etc/omni-ca/ca.crt
+          volumeMounts:
+            - name: omni-ca
+              mountPath: /etc/omni-ca
+              readOnly: true
+          {{- end }}
           ports:
             - name: metrics
               containerPort: 8080
@@ -71,4 +83,10 @@ spec:
       {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.omni.caCert }}
+      volumes:
+        - name: omni-ca
+          configMap:
+            name: {{ include "omni-gitops-controller.name" . }}-ca
       {{- end }}

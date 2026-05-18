@@ -28,8 +28,11 @@ omni:
   # Service account token from `omnictl serviceaccount create`
   token: ""
   # Use an existing Secret instead of creating one from omni.endpoint/omni.token.
-  # Secret must have keys: endpoint, serviceAccountToken
+  # Secret must have keys: endpoint, token
   existingSecret: ""
+  # PEM-encoded CA certificate to trust for Omni's HTTPS endpoint.
+  # When set, a ConfigMap is created and SSL_CERT_FILE is set in the container.
+  caCert: ""
 
 serviceAccount:
   create: true
@@ -43,6 +46,8 @@ resources:
   requests:
     cpu: 10m
     memory: 32Mi
+
+imagePullSecrets: []
 
 nodeSelector: {}
 tolerations: []

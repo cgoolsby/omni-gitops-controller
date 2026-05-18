@@ -1,0 +1,10 @@
+{{- if .Values.omni.caCert -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "omni-gitops-controller.name" . }}-ca
+  namespace: {{ .Values.namespace }}
+data:
+  ca.crt: |
+    {{- .Values.omni.caCert | nindent 4 }}
+{{- end }}

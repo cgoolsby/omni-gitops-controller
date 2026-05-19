@@ -10,10 +10,12 @@ import (
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/pair"
+	omniSpecs "github.com/siderolabs/omni/client/api/omni/specs"
 	omniv1 "github.com/siderolabs/omni/client/pkg/client"
 	"github.com/siderolabs/omni/client/pkg/client/management"
 	omniresources "github.com/siderolabs/omni/client/pkg/omni/resources"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -21,6 +23,7 @@ import (
 type OmniClient struct {
 	state state.State
 	mgmt  *management.Client
+	raw   *omniv1.Client
 }
 
 // NewOmniClient builds a client authenticating with a service account key.
@@ -32,7 +35,53 @@ func NewOmniClient(_ context.Context, endpoint, serviceAccountToken string) (*Om
 	if err != nil {
 		return nil, fmt.Errorf("omni client: %w", err)
 	}
-	return &OmniClient{state: c.Omni().State(), mgmt: c.Management()}, nil
+	return &OmniClient{state: c.Omni().State(), mgmt: c.Management(), raw: c}, nil
+}
+
+// MachineConfigDrift holds machine identity for a node whose running config is behind the desired config.
+type MachineConfigDrift struct {
+	MachineID         string
+	ManagementAddress string
+}
+
+// GetDriftingMachines returns machines in the cluster whose running config does not match the desired
+// config (ConfigUpToDate==false), are in the RUNNING stage, are healthy, and have no config error.
+func (c *OmniClient) GetDriftingMachines(ctx context.Context, clusterName string) ([]MachineConfigDrift, error) {
+	list, err := safe.StateListAll[*omnires.ClusterMachineStatus](ctx, c.state,
+		state.WithLabelQuery(resource.LabelEqual(omnires.LabelCluster, clusterName)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster machine statuses for %s: %w", clusterName, err)
+	}
+
+	var drifting []MachineConfigDrift
+
+	list.ForEach(func(cms *omnires.ClusterMachineStatus) {
+		spec := cms.TypedSpec().Value
+		if !spec.ConfigUpToDate &&
+			spec.Stage == omniSpecs.ClusterMachineStatusSpec_RUNNING &&
+			spec.Ready &&
+			spec.LastConfigError == "" {
+			drifting = append(drifting, MachineConfigDrift{
+				MachineID:         cms.Metadata().ID(),
+				ManagementAddress: spec.ManagementAddress,
+			})
+		}
+	})
+
+	return drifting, nil
+}
+
+// RebootMachine issues a reboot to the specified machine via the Omni Talos API proxy.
+// managementAddress is the machine's management address as reported by ClusterMachineStatus.
+func (c *OmniClient) RebootMachine(ctx context.Context, clusterName, managementAddress string) error {
+	talosClient := c.raw.Talos().WithCluster(clusterName).WithNodes(managementAddress)
+	_, err := talosClient.Reboot(ctx, &machineapi.RebootRequest{})
+	if err != nil {
+		return fmt.Errorf("reboot machine at %s in cluster %s: %w", managementAddress, clusterName, err)
+	}
+
+	return nil
 }
 
 // ClusterStatus is the observed state returned from Omni.

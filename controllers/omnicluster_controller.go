@@ -121,6 +121,15 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setFailure(ctx, cluster, "GetStatusFailed", err)
 	}
 
+	// Detect config drift only when the cluster is ready (machines must be Running).
+	var drifting []MachineConfigDrift
+	if omniStatus.Ready {
+		drifting, err = r.OmniClient.GetDriftingMachines(ctx, clusterName)
+		if err != nil {
+			return r.setFailure(ctx, cluster, "ConfigDriftCheckFailed", err)
+		}
+	}
+
 	cluster.Status.Phase = omniStatus.Phase
 	cluster.Status.Ready = omniStatus.Ready
 	cluster.Status.AllocatedMachines = allocatedMachines
@@ -133,6 +142,24 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		Message:            fmt.Sprintf("Omni cluster phase: %s", omniStatus.Phase),
 		LastTransitionTime: metav1.Now(),
 	})
+
+	if len(drifting) == 0 {
+		setCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionFalse,
+			Reason:             "AllMachinesUpToDate",
+			Message:            "All machines are running the target config",
+			LastTransitionTime: metav1.Now(),
+		})
+	} else {
+		setCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionTrue,
+			Reason:             "PendingReboot",
+			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", drifting[0].MachineID),
+			LastTransitionTime: metav1.Now(),
+		})
+	}
 
 	if err := r.Status().Update(ctx, cluster); err != nil {
 		return ctrl.Result{}, err
@@ -151,6 +178,16 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if kubeconfigErr != nil {
 		return r.setFailure(ctx, cluster, "EnsureKubeconfigFailed", kubeconfigErr)
+	}
+
+	// Reboot the first drifting machine (rolling window = 1, prevents simultaneous reboots in HA clusters).
+	if len(drifting) > 0 {
+		first := drifting[0]
+		logger.Info("Config drift detected, triggering reboot", "machine", first.MachineID, "addr", first.ManagementAddress)
+		if err := r.OmniClient.RebootMachine(ctx, clusterName, first.ManagementAddress); err != nil {
+			logger.Error(err, "Failed to reboot machine", "machine", first.MachineID)
+		}
+		return ctrl.Result{RequeueAfter: requeueLong}, nil
 	}
 
 	logger.Info("Cluster reconciled", "phase", omniStatus.Phase)

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build & Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  crd-drift:
+    name: CRD Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install controller-gen
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
+
+      - name: Regenerate CRDs
+        run: |
+          controller-gen crd:generateEmbeddedObjectMeta=true \
+            paths="./api/..." \
+            output:crd:artifacts:config=config/crd/bases
+
+      - name: Check for drift
+        run: |
+          if ! git diff --exit-code config/crd/bases/; then
+            echo "CRD YAML is out of sync with Go types. Run controller-gen and commit the result."
+            exit 1
+          fi
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m

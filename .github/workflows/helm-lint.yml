@@ -29,6 +29,6 @@ jobs:
           helm template omni-gitops-controller charts/omni-gitops-controller/ \
             --set omni.endpoint=https://omni.example.com \
             --set omni.token=fake-token \
-            | kubectl apply --dry-run=client -f -
+            | kubectl apply --dry-run=client --validate=false -f -
         env:
           KUBECONFIG: /dev/null

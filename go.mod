@@ -4,9 +4,12 @@ go 1.26.2
 
 require (
 	github.com/cosi-project/runtime v1.14.1
+	github.com/siderolabs/gen v0.8.6
 	github.com/siderolabs/omni/client v1.7.2
+	github.com/siderolabs/talos/pkg/machinery v1.13.0-rc.0
+	k8s.io/api v0.35.3
 	k8s.io/apiextensions-apiserver v0.32.1
-	k8s.io/apimachinery v0.35.3
+	k8s.io/apimachinery v0.36.1
 	k8s.io/client-go v0.35.3
 	sigs.k8s.io/controller-runtime v0.20.4
 )
@@ -82,13 +85,11 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/sasha-s/go-deadlock v0.3.9 // indirect
 	github.com/siderolabs/crypto v0.6.5 // indirect
-	github.com/siderolabs/gen v0.8.6 // indirect
 	github.com/siderolabs/go-api-signature v0.3.12 // indirect
 	github.com/siderolabs/go-pointer v1.0.1 // indirect
 	github.com/siderolabs/net v0.4.0 // indirect
 	github.com/siderolabs/proto-codec v0.1.4 // indirect
 	github.com/siderolabs/protoenc v0.2.4 // indirect
-	github.com/siderolabs/talos/pkg/machinery v1.13.0-rc.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xlab/treeprint v1.2.0 // indirect
@@ -113,7 +114,6 @@ require (
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	k8s.io/api v0.35.3 // indirect
 	k8s.io/cli-runtime v0.35.3 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260330154417-16be699c7b31 // indirect

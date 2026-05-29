@@ -235,15 +235,25 @@ func (c *OmniClient) EnsureConfigPatch(ctx context.Context, patchID, clusterName
 			pair.MakePair(omnires.LabelMachineSet, machineSetID),
 			pair.MakePair(omnires.LabelClusterMachine, machineID),
 		)
-		p.TypedSpec().Value.Data = string(data)
+		if err := p.TypedSpec().Value.SetUncompressedData(data); err != nil {
+			return fmt.Errorf("set config patch data: %w", err)
+		}
 		return c.state.Create(ctx, p)
 	}
 	if getErr != nil {
 		return fmt.Errorf("get config patch %s: %w", patchID, getErr)
 	}
 
-	if existing.TypedSpec().Value.Data != string(data) {
-		existing.TypedSpec().Value.Data = string(data)
+	buf, err := existing.TypedSpec().Value.GetUncompressedData()
+	if err != nil {
+		return fmt.Errorf("get existing config patch data: %w", err)
+	}
+	defer buf.Free()
+
+	if string(buf.Data()) != string(data) {
+		if err := existing.TypedSpec().Value.SetUncompressedData(data); err != nil {
+			return fmt.Errorf("set config patch data: %w", err)
+		}
 		return c.state.Update(ctx, existing)
 	}
 	return nil

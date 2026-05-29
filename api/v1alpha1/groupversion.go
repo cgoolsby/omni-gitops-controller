@@ -3,18 +3,21 @@
 package v1alpha1
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
 
 // GroupVersion is the API group + version for all omni-controller CRDs.
 var GroupVersion = schema.GroupVersion{Group: "omni.gitops.dev", Version: "v1alpha1"}
 
 var (
-	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}
+	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 	AddToScheme   = SchemeBuilder.AddToScheme
 )
 
-func init() {
-	SchemeBuilder.Register(&OmniCluster{}, &OmniClusterList{})
+func addKnownTypes(s *runtime.Scheme) error {
+	s.AddKnownTypes(GroupVersion, &OmniCluster{}, &OmniClusterList{})
+	metav1.AddToGroupVersion(s, GroupVersion)
+	return nil
 }

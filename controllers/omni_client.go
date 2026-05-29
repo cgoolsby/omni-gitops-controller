@@ -249,6 +249,41 @@ func (c *OmniClient) EnsureConfigPatch(ctx context.Context, patchID, clusterName
 	return nil
 }
 
+// EnsureMachineExtensions creates or updates the MachineExtensions resource for a machine.
+// The ID of MachineExtensions.omni.sidero.dev is the machine UUID.
+func (c *OmniClient) EnsureMachineExtensions(ctx context.Context, machineID string, extensions []string) error {
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineExtensionsType, machineID, resource.VersionUndefined)
+	existing, err := safe.StateGet[*omnires.MachineExtensions](ctx, c.state, md)
+
+	if state.IsNotFoundError(err) {
+		me := omnires.NewMachineExtensions(machineID)
+		me.TypedSpec().Value.Extensions = extensions
+		return c.state.Create(ctx, me)
+	}
+	if err != nil {
+		return fmt.Errorf("get machine extensions %s: %w", machineID, err)
+	}
+
+	current := existing.TypedSpec().Value.Extensions
+	if !stringSlicesEqual(current, extensions) {
+		existing.TypedSpec().Value.Extensions = extensions
+		return c.state.Update(ctx, existing)
+	}
+	return nil
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // DeleteConfigPatchesForMachine removes all ConfigPatches scoped to a specific machine.
 func (c *OmniClient) DeleteConfigPatchesForMachine(ctx context.Context, clusterName, machineID string) error {
 	list, err := safe.StateListAll[*omnires.ConfigPatch](ctx, c.state,

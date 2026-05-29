@@ -24,6 +24,11 @@ func (in *ConfigPatch) DeepCopy() *ConfigPatch {
 func (in *MachineSetSpec) DeepCopyInto(out *MachineSetSpec) {
 	*out = *in
 	in.MachineSelector.DeepCopyInto(&out.MachineSelector)
+	if in.MachineExtensions != nil {
+		in, out := &in.MachineExtensions, &out.MachineExtensions
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ConfigPatches != nil {
 		in, out := &in.ConfigPatches, &out.ConfigPatches
 		*out = make([]ConfigPatch, len(*in))

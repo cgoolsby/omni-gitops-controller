@@ -31,6 +31,11 @@ type MachineSetSpec struct {
 	// (e.g. omni.sidero.dev/mem, omni.sidero.dev/cpu, omni.sidero.dev/platform).
 	// The controller always adds omni.sidero.dev/available to the query.
 	MachineSelector metav1.LabelSelector `json:"machineSelector"`
+	// MachineExtensions is the list of Talos system extensions to install on each machine in the set.
+	// When non-empty, the controller creates or updates the MachineExtensions.omni.sidero.dev resource
+	// for each matched machine. When absent or empty, existing MachineExtensions are left untouched.
+	// +optional
+	MachineExtensions []string `json:"machineExtensions,omitempty"`
 	// ConfigPatches are Talos machine config patches applied to each machine in the set.
 	// +optional
 	ConfigPatches []ConfigPatch `json:"configPatches,omitempty"`

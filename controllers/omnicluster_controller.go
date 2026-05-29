@@ -273,10 +273,15 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		already = keep
 	}
 
-	// Apply patches to all machines on every reconcile so updates propagate to existing clusters.
+	// Apply patches and extensions to all machines on every reconcile so updates propagate.
 	for _, machineID := range already {
 		if err := r.applyConfigPatches(ctx, clusterName, machineSetID, machineID, spec.ConfigPatches); err != nil {
 			return nil, fmt.Errorf("config patches for %s: %w", machineID, err)
+		}
+		if len(spec.MachineExtensions) > 0 {
+			if err := r.OmniClient.EnsureMachineExtensions(ctx, machineID, spec.MachineExtensions); err != nil {
+				return nil, fmt.Errorf("machine extensions for %s: %w", machineID, err)
+			}
 		}
 	}
 

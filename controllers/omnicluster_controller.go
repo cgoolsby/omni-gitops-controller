@@ -22,9 +22,9 @@ import (
 )
 
 const (
-	finalizerName  = "omnicluster.omni.gitops.dev/finalizer"
-	requeueShort   = 15 * time.Second
-	requeueLong    = 60 * time.Second
+	finalizerName = "omnicluster.omni.gitops.dev/finalizer"
+	requeueShort  = 15 * time.Second
+	requeueLong   = 60 * time.Second
 )
 
 // OmniClusterReconciler reconciles OmniCluster objects.

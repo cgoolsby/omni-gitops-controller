@@ -81,6 +81,14 @@ spec:
                       - name
                       type: object
                     type: array
+                  machineExtensions:
+                    description: |-
+                      MachineExtensions is the list of Talos system extensions to install on each machine in the set.
+                      When non-empty, the controller creates or updates the MachineExtensions.omni.sidero.dev resource
+                      for each matched machine. When absent or empty, existing MachineExtensions are left untouched.
+                    items:
+                      type: string
+                    type: array
                   machineSelector:
                     description: |-
                       MachineSelector selects available Omni machines by label.
@@ -172,6 +180,14 @@ spec:
                         required:
                         - name
                         type: object
+                      type: array
+                    machineExtensions:
+                      description: |-
+                        MachineExtensions is the list of Talos system extensions to install on each machine in the set.
+                        When non-empty, the controller creates or updates the MachineExtensions.omni.sidero.dev resource
+                        for each matched machine. When absent or empty, existing MachineExtensions are left untouched.
+                      items:
+                        type: string
                       type: array
                     machineSelector:
                       description: |-

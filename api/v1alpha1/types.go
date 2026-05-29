@@ -45,7 +45,7 @@ type MachineSetSpec struct {
 type WorkerMachineSetSpec struct {
 	// Name identifies this worker set. Used as the Omni MachineSet suffix
 	// (resulting ID: <cluster>-<name>).
-	Name string `json:"name"`
+	Name           string `json:"name"`
 	MachineSetSpec `json:",inline"`
 }
 

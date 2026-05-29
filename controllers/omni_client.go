@@ -259,19 +259,23 @@ func (c *OmniClient) EnsureConfigPatch(ctx context.Context, patchID, clusterName
 	return nil
 }
 
-// EnsureMachineExtensions creates or updates the MachineExtensions resource for a machine.
-// The ID of MachineExtensions.omni.sidero.dev is the machine UUID.
-func (c *OmniClient) EnsureMachineExtensions(ctx context.Context, machineID string, extensions []string) error {
-	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineExtensionsType, machineID, resource.VersionUndefined)
-	existing, err := safe.StateGet[*omnires.MachineExtensions](ctx, c.state, md)
+// EnsureMachineSetExtensionsConfiguration creates or updates an ExtensionsConfiguration resource
+// scoped to a machine set. Omni reconciles this into per-machine schematic rebuilds automatically.
+// ID convention matches Omni's own template engine: "schematic-<machineSetID>".
+func (c *OmniClient) EnsureMachineSetExtensionsConfiguration(ctx context.Context, clusterName, machineSetID string, extensions []string) error {
+	id := "schematic-" + machineSetID
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, id, resource.VersionUndefined)
+	existing, err := safe.StateGet[*omnires.ExtensionsConfiguration](ctx, c.state, md)
 
 	if state.IsNotFoundError(err) {
-		me := omnires.NewMachineExtensions(machineID)
-		me.TypedSpec().Value.Extensions = extensions
-		return c.state.Create(ctx, me)
+		ec := omnires.NewExtensionsConfiguration(id)
+		ec.Metadata().Labels().Set(omnires.LabelCluster, clusterName)
+		ec.Metadata().Labels().Set(omnires.LabelMachineSet, machineSetID)
+		ec.TypedSpec().Value.Extensions = extensions
+		return c.state.Create(ctx, ec)
 	}
 	if err != nil {
-		return fmt.Errorf("get machine extensions %s: %w", machineID, err)
+		return fmt.Errorf("get extensions configuration %s: %w", id, err)
 	}
 
 	current := existing.TypedSpec().Value.Extensions

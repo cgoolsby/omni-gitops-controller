@@ -290,17 +290,23 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 	return already, nil
 }
 
-// applyConfigPatches creates or updates Omni ConfigPatches for a machine.
+// applyConfigPatches creates or updates Omni ConfigPatches for a machine,
+// then deletes any patches that are no longer in the desired set.
 func (r *OmniClusterReconciler) applyConfigPatches(
 	ctx context.Context,
 	clusterName, machineSetID, machineID string,
 	patches []api.ConfigPatch,
 ) error {
+	keepIDs := make(map[string]struct{}, len(patches))
 	for _, p := range patches {
 		patchID := fmt.Sprintf("%s-%s-%s", clusterName, machineID, p.Name)
+		keepIDs[patchID] = struct{}{}
 		if err := r.OmniClient.EnsureConfigPatch(ctx, patchID, clusterName, machineSetID, machineID, json.RawMessage(p.Inline.Raw)); err != nil {
 			return fmt.Errorf("ensure patch %q: %w", p.Name, err)
 		}
+	}
+	if err := r.OmniClient.PruneOrphanedConfigPatches(ctx, clusterName, machineID, keepIDs); err != nil {
+		return fmt.Errorf("prune patches for machine %s: %w", machineID, err)
 	}
 	return nil
 }

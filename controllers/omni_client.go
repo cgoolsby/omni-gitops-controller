@@ -324,6 +324,35 @@ func (c *OmniClient) DeleteConfigPatchesForMachine(ctx context.Context, clusterN
 	return nil
 }
 
+// PruneOrphanedConfigPatches deletes ConfigPatches for a machine whose IDs are not in keepIDs.
+// Called after applying desired patches so removed patches don't linger in Omni.
+func (c *OmniClient) PruneOrphanedConfigPatches(ctx context.Context, clusterName, machineID string, keepIDs map[string]struct{}) error {
+	list, err := safe.StateListAll[*omnires.ConfigPatch](ctx, c.state,
+		state.WithLabelQuery(
+			resource.LabelEqual(omnires.LabelCluster, clusterName),
+			resource.LabelEqual(omnires.LabelClusterMachine, machineID),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("list config patches for machine %s: %w", machineID, err)
+	}
+
+	var errs []error
+	list.ForEach(func(p *omnires.ConfigPatch) {
+		id := p.Metadata().ID()
+		if _, keep := keepIDs[id]; !keep {
+			if err := c.state.Destroy(ctx, p.Metadata()); err != nil && !state.IsNotFoundError(err) {
+				errs = append(errs, fmt.Errorf("delete orphaned config patch %s: %w", id, err))
+			}
+		}
+	})
+
+	if len(errs) > 0 {
+		return fmt.Errorf("prune config patches for machine %s: %v", machineID, errs)
+	}
+	return nil
+}
+
 // GetClusterStatus returns the current Omni ClusterStatus for the named cluster.
 func (c *OmniClient) GetClusterStatus(ctx context.Context, clusterName string) (ClusterStatus, error) {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterStatusType, clusterName, resource.VersionUndefined)

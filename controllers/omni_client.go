@@ -286,6 +286,29 @@ func (c *OmniClient) EnsureMachineSetExtensionsConfiguration(ctx context.Context
 	return nil
 }
 
+// EnsureMachineKernelArgs creates or updates a KernelArgs resource for a specific machine.
+// KernelArgs are scoped per-machine (ID = machine UUID) and applied at the schematic level,
+// making them active during maintenance/install boot — not just on the installed system.
+func (c *OmniClient) EnsureMachineKernelArgs(ctx context.Context, machineID string, args []string) error {
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, machineID, resource.VersionUndefined)
+	existing, err := safe.StateGet[*omnires.KernelArgs](ctx, c.state, md)
+
+	if state.IsNotFoundError(err) {
+		ka := omnires.NewKernelArgs(machineID)
+		ka.TypedSpec().Value.Args = args
+		return c.state.Create(ctx, ka)
+	}
+	if err != nil {
+		return fmt.Errorf("get kernel args %s: %w", machineID, err)
+	}
+
+	if !stringSlicesEqual(existing.TypedSpec().Value.Args, args) {
+		existing.TypedSpec().Value.Args = args
+		return c.state.Update(ctx, existing)
+	}
+	return nil
+}
+
 func stringSlicesEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

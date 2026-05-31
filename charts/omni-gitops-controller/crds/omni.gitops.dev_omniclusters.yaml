@@ -81,6 +81,19 @@ spec:
                       - name
                       type: object
                     type: array
+                  kernelArgs:
+                    description: KernelArgs is the list of extra kernel arguments
+                      to include in the machine schematic. Active during maintenance/install
+                      boot, not just the installed system.
+                    items:
+                      type: string
+                    type: array
+                  machineExtensions:
+                    description: MachineExtensions is the list of Talos system extensions
+                      to install on each machine in the set.
+                    items:
+                      type: string
+                    type: array
                   machineSelector:
                     description: |-
                       MachineSelector selects available Omni machines by label.
@@ -170,6 +183,19 @@ spec:
                         required:
                         - name
                         type: object
+                      type: array
+                    kernelArgs:
+                      description: KernelArgs is the list of extra kernel arguments
+                        to include in the machine schematic. Active during maintenance/install
+                        boot, not just the installed system.
+                      items:
+                        type: string
+                      type: array
+                    machineExtensions:
+                      description: MachineExtensions is the list of Talos system extensions
+                        to install on each machine in the set.
+                      items:
+                        type: string
                       type: array
                     machineSelector:
                       description: |-

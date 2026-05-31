@@ -36,6 +36,11 @@ type MachineSetSpec struct {
 	// for each matched machine. When absent or empty, existing MachineExtensions are left untouched.
 	// +optional
 	MachineExtensions []string `json:"machineExtensions,omitempty"`
+	// KernelArgs is the list of extra kernel arguments to include in the machine schematic.
+	// These are applied at the schematic level so they are active during maintenance/install boot,
+	// not just on the installed system. Use for args needed before first install (e.g. libata.force=noncq).
+	// +optional
+	KernelArgs []string `json:"kernelArgs,omitempty"`
 	// ConfigPatches are Talos machine config patches applied to each machine in the set.
 	// +optional
 	ConfigPatches []ConfigPatch `json:"configPatches,omitempty"`

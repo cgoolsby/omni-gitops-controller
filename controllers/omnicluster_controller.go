@@ -287,6 +287,15 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		}
 	}
 
+	// Apply kernel args per-machine (schematic-level, active during maintenance/install boot).
+	if len(spec.KernelArgs) > 0 {
+		for _, machineID := range already {
+			if err := r.OmniClient.EnsureMachineKernelArgs(ctx, machineID, spec.KernelArgs); err != nil {
+				return nil, fmt.Errorf("kernel args for machine %s: %w", machineID, err)
+			}
+		}
+	}
+
 	return already, nil
 }
 

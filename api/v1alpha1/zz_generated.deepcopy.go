@@ -29,6 +29,11 @@ func (in *MachineSetSpec) DeepCopyInto(out *MachineSetSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.KernelArgs != nil {
+		in, out := &in.KernelArgs, &out.KernelArgs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ConfigPatches != nil {
 		in, out := &in.ConfigPatches, &out.ConfigPatches
 		*out = make([]ConfigPatch, len(*in))

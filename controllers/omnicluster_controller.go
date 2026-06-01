@@ -280,18 +280,28 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		}
 	}
 
-	// Apply extensions configuration at the machine-set level (one resource covers all machines in the set).
+	// Reconcile extensions configuration at machine-set level.
+	// Delete the resource when the extensions list is cleared so Omni revokes the schematic.
 	if len(spec.MachineExtensions) > 0 {
 		if err := r.OmniClient.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, machineSetID, spec.MachineExtensions); err != nil {
 			return nil, fmt.Errorf("extensions configuration for %s: %w", machineSetID, err)
 		}
+	} else {
+		if err := r.OmniClient.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+			return nil, fmt.Errorf("delete extensions configuration for %s: %w", machineSetID, err)
+		}
 	}
 
-	// Apply kernel args per-machine (schematic-level, active during maintenance/install boot).
-	if len(spec.KernelArgs) > 0 {
-		for _, machineID := range already {
+	// Reconcile kernel args per-machine (schematic-level, active during maintenance/install boot).
+	// Delete the resource when the kernelArgs list is cleared so the args are revoked.
+	for _, machineID := range already {
+		if len(spec.KernelArgs) > 0 {
 			if err := r.OmniClient.EnsureMachineKernelArgs(ctx, machineID, spec.KernelArgs); err != nil {
 				return nil, fmt.Errorf("kernel args for machine %s: %w", machineID, err)
+			}
+		} else {
+			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
+				return nil, fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
 			}
 		}
 	}

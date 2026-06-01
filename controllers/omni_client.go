@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
@@ -250,7 +251,10 @@ func (c *OmniClient) EnsureConfigPatch(ctx context.Context, patchID, clusterName
 	}
 	defer buf.Free()
 
-	if string(buf.Data()) != string(data) {
+	// Use semantic JSON comparison so that encoding differences (whitespace,
+	// key ordering, YAML vs JSON normalisation by the Omni server) don't
+	// suppress real content changes or trigger spurious writes.
+	if !jsonEqual(buf.Data(), data) {
 		if err := existing.TypedSpec().Value.SetUncompressedData(data); err != nil {
 			return fmt.Errorf("set config patch data: %w", err)
 		}
@@ -319,6 +323,41 @@ func stringSlicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// jsonEqual reports whether two JSON byte slices are semantically equal,
+// tolerating differences in key ordering, whitespace, or encoding format
+// (e.g. YAML-normalised bytes returned by the Omni server).
+func jsonEqual(a, b []byte) bool {
+	var va, vb any
+	if err := json.Unmarshal(a, &va); err != nil {
+		return false
+	}
+	if err := json.Unmarshal(b, &vb); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(va, vb)
+}
+
+// DeleteKernelArgsForMachine removes the KernelArgs resource for a specific machine.
+// Called when spec.KernelArgs is cleared so the previously-applied args are revoked.
+func (c *OmniClient) DeleteKernelArgsForMachine(ctx context.Context, machineID string) error {
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, machineID, resource.VersionUndefined)
+	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
+		return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+	}
+	return nil
+}
+
+// DeleteExtensionsConfigurationForMachineSet removes the ExtensionsConfiguration resource
+// for a machine set. Called when spec.MachineExtensions is cleared.
+func (c *OmniClient) DeleteExtensionsConfigurationForMachineSet(ctx context.Context, machineSetID string) error {
+	id := "schematic-" + machineSetID
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, id, resource.VersionUndefined)
+	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
+		return fmt.Errorf("delete extensions configuration for machine set %s: %w", machineSetID, err)
+	}
+	return nil
 }
 
 // DeleteConfigPatchesForMachine removes all ConfigPatches scoped to a specific machine.

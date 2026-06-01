@@ -81,6 +81,14 @@ spec:
                       - name
                       type: object
                     type: array
+                  kernelArgs:
+                    description: |-
+                      KernelArgs is the list of extra kernel arguments to include in the machine schematic.
+                      These are applied at the schematic level so they are active during maintenance/install boot,
+                      not just on the installed system. Use for args needed before first install (e.g. libata.force=noncq).
+                    items:
+                      type: string
+                    type: array
                   machineExtensions:
                     description: |-
                       MachineExtensions is the list of Talos system extensions to install on each machine in the set.
@@ -180,6 +188,14 @@ spec:
                         required:
                         - name
                         type: object
+                      type: array
+                    kernelArgs:
+                      description: |-
+                        KernelArgs is the list of extra kernel arguments to include in the machine schematic.
+                        These are applied at the schematic level so they are active during maintenance/install boot,
+                        not just on the installed system. Use for args needed before first install (e.g. libata.force=noncq).
+                      items:
+                        type: string
                       type: array
                     machineExtensions:
                       description: |-

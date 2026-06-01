@@ -216,8 +216,8 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 
 	// Apply with kernelArgs set.
 	specWithArgs := api.MachineSetSpec{
-		Replicas:    1,
-		KernelArgs:  []string{"libata.force=noncq"},
+		Replicas:      1,
+		KernelArgs:    []string{"libata.force=noncq"},
 		ConfigPatches: nil,
 	}
 	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, specWithArgs); err != nil {
@@ -232,8 +232,8 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 
 	// Now reconcile with kernelArgs cleared.
 	specEmpty := api.MachineSetSpec{
-		Replicas:    1,
-		KernelArgs:  nil,
+		Replicas:      1,
+		KernelArgs:    nil,
 		ConfigPatches: nil,
 	}
 	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, specEmpty); err != nil {

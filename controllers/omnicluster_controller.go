@@ -139,6 +139,13 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	// Prune machine sets that exist in Omni but are no longer declared in spec.
+	// allocatedMachines is built only from spec-declared sets above, so pruned
+	// sets never appear in the status update below.
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		return r.setFailure(ctx, cluster, statusBefore, "PruneOrphanedMachineSetFailed", err)
+	}
+
 	// ── Update status from Omni ───────────────────────────────────────────────
 	omniStatus, err := r.OmniClient.GetClusterStatus(ctx, clusterName)
 	if err != nil {
@@ -333,14 +340,8 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		keep := already[:len(already)-toRemove]
 
 		for _, machineID := range evict {
-			if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
-				return nil, fmt.Errorf("remove machine %s from %s: %w", machineID, machineSetID, err)
-			}
-			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
-				return nil, fmt.Errorf("cleanup patches for evicted machine %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-				return nil, fmt.Errorf("cleanup kernel args for evicted machine %s: %w", machineID, err)
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return nil, fmt.Errorf("evict machine %s from %s: %w", machineID, machineSetID, err)
 			}
 		}
 		already = keep
@@ -380,6 +381,70 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 	}
 
 	return already, nil
+}
+
+// releaseMachine unbinds a machine from its machine set and removes its
+// ConfigPatches and KernelArgs, so the machine returns to the available pool
+// without carrying stale customisation into the next cluster that allocates
+// it. DeleteMachineSetNode returns an error while Omni teardown is in
+// progress, which makes the caller requeue and retry.
+func (r *OmniClusterReconciler) releaseMachine(ctx context.Context, clusterName, machineID string) error {
+	if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
+		return fmt.Errorf("delete machine set node %s: %w", machineID, err)
+	}
+	if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
+		return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
+	}
+	if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
+		return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+	}
+	return nil
+}
+
+// pruneOrphanedMachineSets deletes Omni MachineSets labelled with this cluster
+// that are no longer declared in spec — e.g. when a user removes a worker set
+// from spec.workers without deleting the whole OmniCluster. Like
+// deleteOmniResources, discovery is driven by Omni state (the authoritative
+// source) rather than status.AllocatedMachines, which can be empty or stale.
+func (r *OmniClusterReconciler) pruneOrphanedMachineSets(ctx context.Context, cluster *api.OmniCluster, clusterName string) error {
+	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
+	desired := map[string]bool{cpMachineSetID: true}
+	for _, w := range cluster.Spec.Workers {
+		desired[fmt.Sprintf("%s-%s", clusterName, w.Name)] = true
+	}
+
+	actual, err := r.OmniClient.ListMachineSetIDsForCluster(ctx, clusterName)
+	if err != nil {
+		return fmt.Errorf("list machine sets for cluster %s: %w", clusterName, err)
+	}
+
+	for _, machineSetID := range actual {
+		if desired[machineSetID] {
+			continue
+		}
+		// The control-plane set is always in desired; guard anyway so a bug in
+		// desired-set construction can never tear down the control plane.
+		if machineSetID == cpMachineSetID {
+			continue
+		}
+
+		machines, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+		if err != nil {
+			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
+		}
+		for _, machineID := range machines {
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return fmt.Errorf("release machine from orphaned set %s: %w", machineSetID, err)
+			}
+		}
+		if err := r.OmniClient.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+			return fmt.Errorf("delete extensions configuration for orphaned machine set %s: %w", machineSetID, err)
+		}
+		if err := r.OmniClient.DeleteMachineSet(ctx, machineSetID); err != nil {
+			return fmt.Errorf("delete orphaned machine set %s: %w", machineSetID, err)
+		}
+	}
+	return nil
 }
 
 // applyConfigPatches creates or updates Omni ConfigPatches for a machine,
@@ -450,14 +515,8 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
 		}
 		for _, machineID := range machines {
-			if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
-				return fmt.Errorf("delete machine set node %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
-				return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-				return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return err
 			}
 		}
 	}

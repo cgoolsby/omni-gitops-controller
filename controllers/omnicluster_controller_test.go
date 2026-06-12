@@ -571,6 +571,133 @@ func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
 	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined), "Cluster "+clusterName)
 }
 
+// ── pruneOrphanedMachineSets tests ────────────────────────────────────────────
+
+// setupMachineSetWithResources creates a MachineSet with one bound machine plus
+// the full per-machine/per-set resource complement: a ConfigPatch and
+// KernelArgs for the machine, and an ExtensionsConfiguration for the set.
+func setupMachineSetWithResources(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID, role string) {
+	t.Helper()
+	if err := c.EnsureMachineSet(ctx, clusterName, machineSetID, role); err != nil {
+		t.Fatalf("ensure machine set %s: %v", machineSetID, err)
+	}
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, role)
+	patchID := fmt.Sprintf("%s-%s-%s", clusterName, machineID, "install-disk")
+	inline := json.RawMessage(mustJSON(map[string]any{"machine": map[string]any{"install": map[string]any{"disk": "/dev/sda"}}}))
+	if err := c.EnsureConfigPatch(ctx, patchID, clusterName, machineSetID, machineID, inline); err != nil {
+		t.Fatalf("ensure config patch %s: %v", patchID, err)
+	}
+	if err := c.EnsureMachineKernelArgs(ctx, machineID, []string{"libata.force=noncq"}); err != nil {
+		t.Fatalf("ensure kernel args %s: %v", machineID, err)
+	}
+	if err := c.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, machineSetID, []string{"siderolabs/iscsi-tools"}); err != nil {
+		t.Fatalf("ensure extensions configuration %s: %v", machineSetID, err)
+	}
+}
+
+// TestPruneOrphanedMachineSets_ReleasesRemovedWorkerSet verifies that a worker
+// machine set removed from spec.workers is torn down in Omni — its
+// MachineSetNodes, ConfigPatches, KernelArgs, ExtensionsConfiguration, and the
+// MachineSet itself — while a still-declared set and the control-plane set are
+// left untouched.
+func TestPruneOrphanedMachineSets_ReleasesRemovedWorkerSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := omnires.ControlPlanesResourceID(clusterName)
+	keepSetID := clusterName + "-workers-keep"
+	orphanSetID := clusterName + "-workers-orphan"
+
+	setupMachineSetWithResources(t, ctx, c, clusterName, cpSetID, "cp-uuid-1", omnires.LabelControlPlaneRole)
+	setupMachineSetWithResources(t, ctx, c, clusterName, keepSetID, "worker-uuid-keep", omnires.LabelWorkerRole)
+	setupMachineSetWithResources(t, ctx, c, clusterName, orphanSetID, "worker-uuid-orphan", omnires.LabelWorkerRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+
+	// Spec declares only the "workers-keep" set; "workers-orphan" was removed.
+	cluster := &api.OmniCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName},
+		Spec: api.OmniClusterSpec{
+			Workers: []api.WorkerMachineSetSpec{
+				{Name: "workers-keep", MachineSetSpec: api.MachineSetSpec{Replicas: 1}},
+			},
+		},
+	}
+
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		t.Fatalf("pruneOrphanedMachineSets: %v", err)
+	}
+
+	assertGone := func(md resource.Metadata, desc string) {
+		t.Helper()
+		_, err := st.Get(ctx, md)
+		if err == nil {
+			t.Errorf("%s should have been pruned but still exists", desc)
+		} else if !state.IsNotFoundError(err) {
+			t.Fatalf("unexpected error checking %s: %v", desc, err)
+		}
+	}
+	assertPresent := func(md resource.Metadata, desc string) {
+		t.Helper()
+		if _, err := st.Get(ctx, md); err != nil {
+			t.Errorf("%s should have survived pruning: %v", desc, err)
+		}
+	}
+
+	// The orphaned set and all its resources are gone.
+	orphanPatchID := fmt.Sprintf("%s-%s-%s", clusterName, "worker-uuid-orphan", "install-disk")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, "worker-uuid-orphan", resource.VersionUndefined), "MachineSetNode worker-uuid-orphan")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, orphanPatchID, resource.VersionUndefined), "ConfigPatch "+orphanPatchID)
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, "worker-uuid-orphan", resource.VersionUndefined), "KernelArgs worker-uuid-orphan")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+orphanSetID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+orphanSetID)
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, orphanSetID, resource.VersionUndefined), "MachineSet "+orphanSetID)
+
+	// The surviving worker set and the control-plane set are untouched.
+	for _, s := range []struct{ setID, machineID string }{
+		{keepSetID, "worker-uuid-keep"},
+		{cpSetID, "cp-uuid-1"},
+	} {
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, s.machineID, resource.VersionUndefined), "MachineSetNode "+s.machineID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, patchID, resource.VersionUndefined), "ConfigPatch "+patchID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, s.machineID, resource.VersionUndefined), "KernelArgs "+s.machineID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+s.setID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+s.setID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, s.setID, resource.VersionUndefined), "MachineSet "+s.setID)
+	}
+}
+
+// TestPruneOrphanedMachineSets_NeverPrunesControlPlane verifies that the
+// control-plane machine set is never selected for pruning, even when the spec
+// declares no workers at all.
+func TestPruneOrphanedMachineSets_NeverPrunesControlPlane(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := omnires.ControlPlanesResourceID(clusterName)
+
+	setupMachineSetWithResources(t, ctx, c, clusterName, cpSetID, "cp-uuid-1", omnires.LabelControlPlaneRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		t.Fatalf("pruneOrphanedMachineSets: %v", err)
+	}
+
+	msMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, cpSetID, resource.VersionUndefined)
+	if _, err := st.Get(ctx, msMD); err != nil {
+		t.Errorf("control-plane MachineSet should never be pruned: %v", err)
+	}
+	nodeMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, "cp-uuid-1", resource.VersionUndefined)
+	if _, err := st.Get(ctx, nodeMD); err != nil {
+		t.Errorf("control-plane MachineSetNode should never be pruned: %v", err)
+	}
+}
+
 // ── EnsureCluster ownership tests ─────────────────────────────────────────────
 
 // TestEnsureCluster_SameOwnerUpdates verifies that the CR that created an Omni

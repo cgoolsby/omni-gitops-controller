@@ -456,8 +456,9 @@ func (c *OmniClient) DeleteCluster(ctx context.Context, clusterName string) erro
 }
 
 // GetKubeconfig fetches a service-account kubeconfig from Omni for the named cluster
-// via the management API. The token TTL is 90 days; ensureKubeconfigSecret refreshes
-// it on every reconcile so the actual expiry window is just a safety margin.
+// via the management API. The token TTL is 90 days; the ensure functions re-fetch it
+// only when the stored Secret is older than kubeconfigRefreshInterval (30 days), so
+// the token is always replaced well before it expires.
 func (c *OmniClient) GetKubeconfig(ctx context.Context, clusterName string) ([]byte, error) {
 	data, err := c.mgmt.WithCluster(clusterName).Kubeconfig(ctx,
 		management.WithServiceAccount(90*24*time.Hour, "flux-admin", "system:masters"),

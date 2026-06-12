@@ -32,6 +32,12 @@ const (
 	// same machine, so a machine whose drift persists across reboots is not
 	// rebooted in a loop every reconcile cycle.
 	rebootCooldown = 10 * time.Minute
+
+	kubeconfigRefreshedAtAnnotation = "omni.gitops.dev/kubeconfig-refreshed-at"
+	// kubeconfigRefreshInterval is how often the kubeconfig Secret is re-fetched
+	// from Omni. Must be comfortably shorter than the 90-day token TTL requested
+	// in GetKubeconfig so the token never expires in place.
+	kubeconfigRefreshInterval = 30 * 24 * time.Hour
 )
 
 // OmniClusterReconciler reconciles OmniCluster objects.
@@ -440,20 +446,55 @@ func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.Omn
 	return ctrl.Result{RequeueAfter: requeueShort}, err
 }
 
+// secretNeedsRefresh reports whether the kubeconfig Secret must be re-fetched
+// from Omni: it is missing, lacks the expected data key, or its refresh
+// annotation is absent, unparsable, or older than the refresh interval.
+func secretNeedsRefresh(secret *corev1.Secret, dataKey string, now time.Time) bool {
+	if secret == nil {
+		return true
+	}
+	if _, ok := secret.Data[dataKey]; !ok {
+		return true
+	}
+	refreshedAt, err := time.Parse(time.RFC3339, secret.Annotations[kubeconfigRefreshedAtAnnotation])
+	if err != nil {
+		return true
+	}
+	return now.Sub(refreshedAt) >= kubeconfigRefreshInterval
+}
+
 // ensureKubeconfigSecret fetches the cluster kubeconfig from Omni and writes it
-// as a Secret for Flux remote cluster apply.
+// as a Secret for Flux remote cluster apply. The fetch is skipped while the
+// existing Secret is younger than kubeconfigRefreshInterval, so a new
+// service-account token is not minted on every reconcile.
 func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clusterName string) error {
+	now := time.Now()
+	secretName := clusterName + "-kubeconfig"
+
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("get kubeconfig secret %s: %w", secretName, err)
+	}
+	if err == nil && !secretNeedsRefresh(existing, "value", now) {
+		return nil
+	}
+
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
 		return err
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterName + "-kubeconfig",
+			Name:      secretName,
 			Namespace: r.KubeconfigNamespace,
 		},
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[kubeconfigRefreshedAtAnnotation] = now.Format(time.RFC3339)
 		secret.Data = map[string][]byte{"value": data}
 		return nil
 	})
@@ -461,7 +502,22 @@ func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clus
 }
 
 // ensureArgoCDClusterSecret writes the cluster kubeconfig as an ArgoCD cluster Secret.
+// The fetch is skipped while the existing Secret is younger than
+// kubeconfigRefreshInterval, so a new service-account token is not minted on
+// every reconcile.
 func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, clusterName string) error {
+	now := time.Now()
+	secretName := clusterName + "-cluster-secret"
+
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("get argocd cluster secret %s: %w", secretName, err)
+	}
+	if err == nil && !secretNeedsRefresh(existing, "config", now) {
+		return nil
+	}
+
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
 		return err
@@ -507,7 +563,7 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterName + "-cluster-secret",
+			Name:      secretName,
 			Namespace: r.KubeconfigNamespace,
 		},
 	}
@@ -516,6 +572,10 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 			secret.Labels = map[string]string{}
 		}
 		secret.Labels["argocd.argoproj.io/secret-type"] = "cluster"
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations[kubeconfigRefreshedAtAnnotation] = now.Format(time.RFC3339)
 		secret.Data = map[string][]byte{
 			"name":   []byte(clusterName),
 			"server": []byte(clusterEntry.Server),

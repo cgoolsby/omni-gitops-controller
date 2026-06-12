@@ -649,3 +649,65 @@ func TestStatusNeedsUpdate(t *testing.T) {
 		}
 	})
 }
+
+// ── secretNeedsRefresh tests ───────────────────────────────────────────────────
+
+func TestSecretNeedsRefresh(t *testing.T) {
+	now := time.Now()
+
+	newSecret := func(data map[string][]byte, annotations map[string]string) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+			Data:       data,
+		}
+	}
+
+	t.Run("nil secret needs refresh", func(t *testing.T) {
+		if !secretNeedsRefresh(nil, "value", now) {
+			t.Error("expected nil secret to need refresh")
+		}
+	})
+
+	t.Run("missing data key needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"other": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Format(time.RFC3339),
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret without data key to need refresh")
+		}
+	})
+
+	t.Run("missing annotation needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, nil)
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret without refresh annotation to need refresh")
+		}
+	})
+
+	t.Run("fresh annotation does not need refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Add(-time.Hour).Format(time.RFC3339),
+		})
+		if secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected 1-hour-old secret to not need refresh")
+		}
+	})
+
+	t.Run("annotation older than interval needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Add(-kubeconfigRefreshInterval - time.Hour).Format(time.RFC3339),
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret older than refresh interval to need refresh")
+		}
+	})
+
+	t.Run("unparsable annotation needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: "not-a-timestamp",
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret with unparsable annotation to need refresh")
+		}
+	})
+}

@@ -49,19 +49,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install controller-gen
-        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
-
       - name: Regenerate CRDs
-        run: |
-          controller-gen crd:generateEmbeddedObjectMeta=true \
-            paths="./api/..." \
-            output:crd:artifacts:config=config/crd/bases
+        run: make manifests
 
       - name: Check for drift
         run: |
-          if ! git diff --exit-code config/crd/bases/; then
-            echo "CRD YAML is out of sync with Go types. Run controller-gen and commit the result."
+          if ! git diff --exit-code config/crd/bases/ charts/omni-gitops-controller/crds/; then
+            echo "CRD YAML is out of sync with Go types. Run 'make manifests' and commit the result."
             exit 1
           fi
 

@@ -266,8 +266,29 @@ func (c *OmniClient) EnsureMachineSetNode(ctx context.Context, clusterName, mach
 	ms.Metadata().Labels().Set(role, "")
 
 	node := omnires.NewMachineSetNode(machineID, ms)
-	if err := c.state.Create(ctx, node); err != nil && !state.IsConflictError(err) {
-		return fmt.Errorf("create machine set node %s in %s: %w", machineID, machineSetID, err)
+	if err := c.state.Create(ctx, node); err != nil {
+		if !state.IsConflictError(err) {
+			return fmt.Errorf("create machine set node %s in %s: %w", machineID, machineSetID, err)
+		}
+
+		// A MachineSetNode with this ID already exists. NewMachineSetNode stamps
+		// LabelMachineSet with the owning MachineSet's ID, so check the existing
+		// resource really belongs to this set — otherwise the machine was bound
+		// elsewhere (another OmniCluster, the Omni UI) between selection and Create,
+		// and counting it as ours would silently diverge from reality.
+		md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, machineID, resource.VersionUndefined)
+		existing, getErr := safe.StateGet[*omnires.MachineSetNode](ctx, c.state, md)
+		if getErr != nil {
+			return fmt.Errorf("verify existing machine set node %s: %w", machineID, getErr)
+		}
+
+		boundSet, ok := existing.Metadata().Labels().Get(omnires.LabelMachineSet)
+		if !ok {
+			return fmt.Errorf("machine %s already has a machine set node without a %s label, cannot bind to %s", machineID, omnires.LabelMachineSet, machineSetID)
+		}
+		if boundSet != machineSetID {
+			return fmt.Errorf("machine %s is already bound to machine set %s, cannot bind to %s", machineID, boundSet, machineSetID)
+		}
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -980,4 +981,48 @@ func TestSecretNeedsRefresh(t *testing.T) {
 			t.Error("expected secret with unparsable annotation to need refresh")
 		}
 	})
+}
+
+// ── EnsureMachineSetNode conflict tests ───────────────────────────────────────
+
+// TestEnsureMachineSetNode_IdempotentSameSet verifies that re-binding a machine
+// to the machine set it is already bound to succeeds without error.
+func TestEnsureMachineSetNode_IdempotentSameSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "cluster-a"
+	machineSetID := "cluster-a-workers"
+	machineID := "m1"
+
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+		t.Fatalf("first EnsureMachineSetNode: %v", err)
+	}
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+		t.Errorf("second EnsureMachineSetNode for the same set should be idempotent, got: %v", err)
+	}
+}
+
+// TestEnsureMachineSetNode_ConflictDifferentSet verifies that binding a machine
+// already owned by another machine set fails loudly instead of silently
+// counting the machine as allocated to the new set.
+func TestEnsureMachineSetNode_ConflictDifferentSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	machineID := "m1"
+
+	if err := c.EnsureMachineSetNode(ctx, "cluster-a", "cluster-a-workers", machineID, omnires.LabelWorkerRole); err != nil {
+		t.Fatalf("bind to cluster-a-workers: %v", err)
+	}
+
+	err := c.EnsureMachineSetNode(ctx, "cluster-b", "cluster-b-workers", machineID, omnires.LabelWorkerRole)
+	if err == nil {
+		t.Fatal("expected error binding machine already owned by cluster-a-workers, got nil")
+	}
+	if !strings.Contains(err.Error(), "cluster-a-workers") {
+		t.Errorf("error should name the conflicting machine set cluster-a-workers, got: %v", err)
+	}
 }

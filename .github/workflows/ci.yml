@@ -50,7 +50,7 @@ jobs:
           cache: true
 
       - name: Install controller-gen
-        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
 
       - name: Regenerate CRDs
         run: |
@@ -76,8 +76,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-
       - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=5m

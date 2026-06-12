@@ -208,11 +208,15 @@ Flux can immediately target the cluster using a `Kustomization` with
 | `spec.controlPlane.configPatches[]` | `[]ConfigPatch` | no | — | Talos machine config patches applied to every control-plane machine. |
 | `spec.controlPlane.configPatches[].name` | `string` | yes | — | Unique identifier for this patch within the machine set. |
 | `spec.controlPlane.configPatches[].inline` | `JSON` | yes | — | Patch content in Talos machine config YAML/JSON format. |
+| `spec.controlPlane.machineExtensions[]` | `[]string` | no | — | Talos system extension IDs (e.g. `siderolabs/nvidia-open-gpu-kernel-modules`). Creates/updates an `ExtensionsConfiguration` scoped to the machine set; clearing the list deletes it so the schematic reverts. |
+| `spec.controlPlane.kernelArgs[]` | `[]string` | no | — | Extra kernel args applied at the **schematic** level (active during maintenance/install boot, e.g. `libata.force=noncq`). Clearing the list removes the per-machine `KernelArgs` resource; evicted machines also release theirs. |
 | `spec.workers[]` | `[]WorkerMachineSetSpec` | no | — | Additional worker machine sets. Omit for single-node clusters. |
 | `spec.workers[].name` | `string` | yes | — | Identifies the worker set. Becomes the Omni MachineSet suffix: `<cluster>-<name>`. |
 | `spec.workers[].replicas` | `int32` | no | `1` | Number of worker machines in this set. |
 | `spec.workers[].machineSelector` | `LabelSelector` | yes | — | Selects available machines for this worker set. |
 | `spec.workers[].configPatches[]` | `[]ConfigPatch` | no | — | Config patches applied to every machine in this worker set. |
+| `spec.workers[].machineExtensions[]` | `[]string` | no | — | Talos system extension IDs for this worker set. Same semantics as `spec.controlPlane.machineExtensions[]`. |
+| `spec.workers[].kernelArgs[]` | `[]string` | no | — | Extra schematic-level kernel args for this worker set. Same semantics as `spec.controlPlane.kernelArgs[]`. |
 
 ### Status Fields
 
@@ -395,6 +399,7 @@ See [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) for a complet
 | [`examples/single-node.yaml`](examples/single-node.yaml) | Single control-plane node, no workers. |
 | [`examples/ha-control-plane.yaml`](examples/ha-control-plane.yaml) | Three-node HA control plane + worker pool, selected by RAM label. |
 | [`examples/with-config-patches.yaml`](examples/with-config-patches.yaml) | Config patches for KubePrism, sysctl tuning, and GPU kernel modules. |
+| [`examples/with-extensions-and-kernel-args.yaml`](examples/with-extensions-and-kernel-args.yaml) | GPU worker pool with NVIDIA system extensions, schematic-level kernel args, and a config patch loading the nvidia modules. |
 | [`examples/flux-kustomization.yaml`](examples/flux-kustomization.yaml) | Flux `Kustomization` resources targeting a provisioned cluster. |
 | [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) | `OmniCluster` for use with `--argocd-clusters`. |
 

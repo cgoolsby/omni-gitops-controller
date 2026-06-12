@@ -1,0 +1,47 @@
+# OmniCluster with Talos system extensions and schematic-level kernel args.
+#
+# When to use each field:
+#   - machineExtensions: install Talos system extensions (drivers, runtimes)
+#     on every machine in the set. The controller creates an
+#     ExtensionsConfiguration scoped to the machine set; clearing the list
+#     deletes it so the schematic reverts to stock.
+#   - kernelArgs: extra kernel command-line arguments baked into the machine
+#     schematic, so they are active even during maintenance/install boot.
+#     Clearing the list removes the per-machine KernelArgs resource.
+#   - configPatches: Talos machine config changes (e.g. loading kernel
+#     modules shipped by an extension) that apply once the machine joins
+#     the cluster.
+apiVersion: omni.gitops.dev/v1alpha1
+kind: OmniCluster
+metadata:
+  name: gpu-cluster-example
+  namespace: omni-gitops-system
+spec:
+  kubernetesVersion: "1.31.0"
+  talosVersion: "v1.9.0"
+  controlPlane:
+    replicas: 1
+    machineSelector:
+      matchLabels: {}
+  workers:
+    - name: gpu
+      replicas: 1
+      machineSelector:
+        matchLabels:
+          omni.sidero.dev/platform: metal
+      machineExtensions:
+        - siderolabs/nvidia-open-gpu-kernel-modules
+        - siderolabs/nvidia-container-toolkit
+      kernelArgs:
+        - iommu=pt
+        - intel_iommu=on
+      configPatches:
+        - name: nvidia-kernel-modules
+          inline:
+            machine:
+              kernel:
+                modules:
+                  - name: nvidia
+                  - name: nvidia_uvm
+                  - name: nvidia_drm
+                  - name: nvidia_modeset

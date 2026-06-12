@@ -24,16 +24,14 @@ fi
 if [[ "${FABLE5_YOLO:-0}" == "1" ]]; then
   CLAUDE_ARGS+=(--dangerously-skip-permissions)
 else
-  CLAUDE_ARGS+=(--allowedTools \
-    "Bash(go:*)" "Bash(gofmt:*)" "Bash(controller-gen:*)" \
-    "Bash(cp:*)" "Bash(ls:*)" "Bash(cat:*)" "Bash(diff:*)" \
-    "Bash(git diff:*)" "Bash(git status:*)" "Bash(git log:*)" \
-    "Bash(grep:*)" "Bash(find:*)")
+  # Single comma-separated value: --allowedTools is variadic and would otherwise
+  # swallow the prompt argument.
+  CLAUDE_ARGS+=(--allowedTools "Bash(go:*),Bash(gofmt:*),Bash(controller-gen:*),Bash(cp:*),Bash(ls:*),Bash(cat:*),Bash(diff:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(grep:*),Bash(find:*)")
 fi
 
-run_claude() { # $1 = prompt text on stdin-safe string
+run_claude() { # prompt text on stdin
   # Unset nesting markers so a parent Claude Code session doesn't confuse the child.
-  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" "$1"
+  env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"
 }
 
 # ── verification gate ─────────────────────────────────────────────────────────
@@ -88,7 +86,7 @@ for prompt_file in fable5/[0-9][0-9]-*.md; do
   fi
 
   echo "── $name: running claude"
-  run_claude "$(cat "$prompt_file")" >"$LOG_DIR/$name.log" 2>&1 || {
+  run_claude <"$prompt_file" >"$LOG_DIR/$name.log" 2>&1 || {
     echo "error: claude failed on $name (see $LOG_DIR/$name.log)" >&2
     exit 1
   }
@@ -102,7 +100,7 @@ Do not commit. Do not touch metaPrompts/.
 
 Verification output:
 $(tail -100 "$LOG_DIR/gate.log")"
-    run_claude "$retry_prompt" >"$LOG_DIR/$name.retry.log" 2>&1 || true
+    run_claude <<<"$retry_prompt" >"$LOG_DIR/$name.retry.log" 2>&1 || true
     if ! gate; then
       echo "error: $name still failing after retry (see $LOG_DIR/gate.log); aborting" >&2
       exit 1

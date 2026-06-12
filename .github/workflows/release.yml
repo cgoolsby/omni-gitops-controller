@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: write       # for GitHub Release creation
       packages: write       # for ghcr.io push
-      id-token: write       # for cosign keyless signing (optional, see below)
+      id-token: write       # for cosign keyless signing
 
     steps:
       - uses: actions/checkout@v6
@@ -52,6 +52,7 @@ jobs:
             type=sha
 
       - name: Build and push Docker image
+        id: build-push
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -61,6 +62,33 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the published image
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in ${TAGS}; do
+            cosign sign --yes "${tag}@${DIGEST}"
+          done
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          upload-artifact: false
+
+      - name: Attach SBOM to image
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: |
+          cosign attach sbom --sbom sbom.cyclonedx.json \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
       - name: Update Helm chart appVersion
         run: |

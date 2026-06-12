@@ -144,6 +144,24 @@ kubectl create secret generic omni-credentials \
 kubectl apply -k https://github.com/cgoolsby/omni-gitops-controller/config/default
 ```
 
+**Verifying the image (optional):**
+
+Release images are signed with [cosign](https://github.com/sigstore/cosign)
+keyless signing via GitHub OIDC, and ship with an attached CycloneDX SBOM.
+To verify a release image:
+
+```bash
+cosign verify ghcr.io/cgoolsby/omni-gitops-controller:<version> \
+  --certificate-identity-regexp='^https://github.com/cgoolsby/omni-gitops-controller/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+```
+
+To download the SBOM:
+
+```bash
+cosign download sbom ghcr.io/cgoolsby/omni-gitops-controller:<version> > sbom.cyclonedx.json
+```
+
 ### 3. Declare your first cluster
 
 ```yaml

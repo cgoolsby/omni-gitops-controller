@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -46,8 +47,17 @@ type OmniClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	OmniClient          *OmniClient
+	Recorder            record.EventRecorder
 	KubeconfigNamespace string
 	ArgoCDClusters      bool
+}
+
+// eventf records an event on the cluster. Recorder may be nil (unit tests
+// construct the reconciler without a manager), in which case this is a no-op.
+func (r *OmniClusterReconciler) eventf(cluster *api.OmniCluster, eventType, reason, format string, args ...any) {
+	if r.Recorder != nil {
+		r.Recorder.Eventf(cluster, eventType, reason, format, args...)
+	}
 }
 
 // +kubebuilder:rbac:groups=omni.gitops.dev,resources=omniclusters,verbs=get;list;watch;create;update;patch;delete
@@ -224,6 +234,8 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
 			ObservedGeneration: cluster.Generation,
 		})
+		r.eventf(cluster, corev1.EventTypeWarning, "RebootCooldown",
+			"Machine(s) %s still drifting after a recent reboot; waiting for the %s cooldown", strings.Join(waiting, ", "), rebootCooldown)
 	}
 
 	if statusNeedsUpdate(statusBefore, &cluster.Status) {
@@ -237,14 +249,24 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 
-	var kubeconfigErr error
+	var (
+		kubeconfigName    string
+		kubeconfigWritten bool
+		kubeconfigErr     error
+	)
 	if r.ArgoCDClusters {
-		kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
+		kubeconfigName = clusterName + "-cluster-secret"
+		kubeconfigWritten, kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
 	} else {
-		kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
+		kubeconfigName = clusterName + "-kubeconfig"
+		kubeconfigWritten, kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
 	}
 	if kubeconfigErr != nil {
 		return r.setFailure(ctx, cluster, statusBefore, "EnsureKubeconfigFailed", kubeconfigErr)
+	}
+	if kubeconfigWritten {
+		r.eventf(cluster, corev1.EventTypeNormal, "KubeconfigWritten",
+			"Kubeconfig written to %s/%s", r.KubeconfigNamespace, kubeconfigName)
 	}
 
 	// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
@@ -255,6 +277,10 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("Config drift detected, triggering reboot", "machine", rebootCandidate.MachineID, "addr", rebootCandidate.ManagementAddress)
 		if err := r.OmniClient.RebootMachine(ctx, clusterName, rebootCandidate.ManagementAddress); err != nil {
 			logger.Error(err, "Failed to reboot machine", "machine", rebootCandidate.MachineID)
+			r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
+		} else {
+			r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
+				"Rebooting machine %s to apply config update", rebootCandidate.MachineID)
 		}
 		return ctrl.Result{RequeueAfter: requeueLong}, nil
 	}
@@ -313,6 +339,8 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 			}
 			already = append(already, machineID)
 		}
+		r.eventf(cluster, corev1.EventTypeNormal, "MachinesAllocated",
+			"Allocated %d machine(s) to %s", len(fresh), machineSetID)
 
 	} else if needed < 0 {
 		// ── Scale down ────────────────────────────────────────────────────────
@@ -531,7 +559,11 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 		}
 	}
 
-	return r.OmniClient.DeleteCluster(ctx, clusterName)
+	if err := r.OmniClient.DeleteCluster(ctx, clusterName); err != nil {
+		return err
+	}
+	r.eventf(cluster, corev1.EventTypeNormal, "ClusterDeleted", "Omni cluster resources deleted")
+	return nil
 }
 
 // setFailure updates status with a failure reason and requeues. The write is
@@ -539,6 +571,7 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 // not retrigger reconcile through our own watch.
 func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.OmniCluster, statusBefore *api.OmniClusterStatus, reason string, err error) (ctrl.Result, error) {
 	msg := err.Error()
+	r.eventf(cluster, corev1.EventTypeWarning, reason, "%s", msg)
 	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Ready = false
 	cluster.Status.FailureReason = &reason
@@ -576,23 +609,24 @@ func secretNeedsRefresh(secret *corev1.Secret, dataKey string, now time.Time) bo
 // ensureKubeconfigSecret fetches the cluster kubeconfig from Omni and writes it
 // as a Secret for Flux remote cluster apply. The fetch is skipped while the
 // existing Secret is younger than kubeconfigRefreshInterval, so a new
-// service-account token is not minted on every reconcile.
-func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clusterName string) error {
+// service-account token is not minted on every reconcile. The returned bool
+// reports whether the Secret was actually written (false on the skip path).
+func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clusterName string) (bool, error) {
 	now := time.Now()
 	secretName := clusterName + "-kubeconfig"
 
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
 	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("get kubeconfig secret %s: %w", secretName, err)
+		return false, fmt.Errorf("get kubeconfig secret %s: %w", secretName, err)
 	}
 	if err == nil && !secretNeedsRefresh(existing, "value", now) {
-		return nil
+		return false, nil
 	}
 
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -608,47 +642,48 @@ func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clus
 		secret.Data = map[string][]byte{"value": data}
 		return nil
 	})
-	return err
+	return err == nil, err
 }
 
 // ensureArgoCDClusterSecret writes the cluster kubeconfig as an ArgoCD cluster Secret.
 // The fetch is skipped while the existing Secret is younger than
 // kubeconfigRefreshInterval, so a new service-account token is not minted on
-// every reconcile.
-func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, clusterName string) error {
+// every reconcile. The returned bool reports whether the Secret was actually
+// written (false on the skip path).
+func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, clusterName string) (bool, error) {
 	now := time.Now()
 	secretName := clusterName + "-cluster-secret"
 
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
 	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("get argocd cluster secret %s: %w", secretName, err)
+		return false, fmt.Errorf("get argocd cluster secret %s: %w", secretName, err)
 	}
 	if err == nil && !secretNeedsRefresh(existing, "config", now) {
-		return nil
+		return false, nil
 	}
 
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	cfg, err := clientcmd.Load(data)
 	if err != nil {
-		return fmt.Errorf("parse kubeconfig: %w", err)
+		return false, fmt.Errorf("parse kubeconfig: %w", err)
 	}
 
 	kctx, ok := cfg.Contexts[cfg.CurrentContext]
 	if !ok {
-		return fmt.Errorf("context %q not found in kubeconfig", cfg.CurrentContext)
+		return false, fmt.Errorf("context %q not found in kubeconfig", cfg.CurrentContext)
 	}
 	clusterEntry, ok := cfg.Clusters[kctx.Cluster]
 	if !ok {
-		return fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
+		return false, fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
 	}
 	authInfo, ok := cfg.AuthInfos[kctx.AuthInfo]
 	if !ok {
-		return fmt.Errorf("user %q not found in kubeconfig", kctx.AuthInfo)
+		return false, fmt.Errorf("user %q not found in kubeconfig", kctx.AuthInfo)
 	}
 
 	type tlsClientConfig struct {
@@ -668,7 +703,7 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal argocd config: %w", err)
+		return false, fmt.Errorf("marshal argocd config: %w", err)
 	}
 
 	secret := &corev1.Secret{
@@ -693,7 +728,7 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 		}
 		return nil
 	})
-	return err
+	return err == nil, err
 }
 
 func (r *OmniClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {

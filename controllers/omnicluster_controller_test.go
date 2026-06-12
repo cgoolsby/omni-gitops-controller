@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1277,5 +1278,38 @@ func TestSelectAvailableMachines_InvalidSelector(t *testing.T) {
 	}, 10)
 	if err == nil {
 		t.Fatal("expected error for In expression without values, got nil")
+	}
+}
+
+// ── Event emission tests ──────────────────────────────────────────────────────
+
+// TestReconcileMachineSet_EmitsMachinesAllocatedEvent verifies that binding
+// fresh machines to a machine set emits a MachinesAllocated event.
+func TestReconcileMachineSet_EmitsMachinesAllocatedEvent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	createMachineStatus(ctx, t, st, "machine-uuid-9", true, nil)
+
+	recorder := record.NewFakeRecorder(10)
+	r := &OmniClusterReconciler{OmniClient: c, Recorder: recorder}
+
+	allocated, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, "test-cluster", "test-cluster-workers",
+		omnires.LabelWorkerRole, api.MachineSetSpec{Replicas: 1})
+	if err != nil {
+		t.Fatalf("reconcileMachineSet: %v", err)
+	}
+	if len(allocated) != 1 {
+		t.Fatalf("expected 1 allocated machine, got %v", allocated)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "MachinesAllocated") {
+			t.Errorf("expected MachinesAllocated event, got %q", ev)
+		}
+	default:
+		t.Error("expected a MachinesAllocated event, got none")
 	}
 }

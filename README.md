@@ -392,6 +392,69 @@ See [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) for a complet
 
 ---
 
+## Config Drift Detection
+
+Config changes declared in Git propagate to running machines automatically. When you change
+`configPatches` (or other config-level spec fields) on an `OmniCluster`, the controller pushes
+the new desired config to Omni, and each machine's running config falls behind — Omni reports
+`ConfigUpToDate: false` for that machine. Applying the new config to a Talos machine requires a
+reboot, which the controller performs one machine at a time.
+
+**Detection.** On every reconcile of a Ready cluster, the controller lists Omni's
+`ClusterMachineStatus` resources for the cluster and collects machines whose config is out of
+date (and that have no config error — a machine with a `LastConfigError` is never rebooted,
+since rebooting won't fix a bad config).
+
+**Cluster-wide health gate.** Reboots are only considered when **every** machine in the cluster
+is in the `RUNNING` stage and Ready. If any machine is unhealthy — including one still coming
+back from a previous drift-correction reboot — no reboot candidates are offered that cycle.
+This is what enforces "at most one machine down at a time": the next reboot is not issued until
+the previous machine has fully rejoined. In an HA control plane this preserves etcd quorum.
+
+**Reboot cooldown.** Each machine's last reboot attempt is recorded in
+`status.lastRebootTimes` (keyed by machine ID, written before the reboot RPC so a failed RPC
+doesn't cause hammering). A machine is not rebooted again within **10 minutes** of its last
+attempt. If a machine is still drifting inside that window — for example, the config genuinely
+requires more than a reboot — the controller surfaces it via the `RebootCooldown` condition and
+a Warning event instead of reboot-looping it.
+
+**Conditions.** Drift state is reported on the `ConfigDriftDetected` condition:
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | `PendingReboot` | A drifting machine was found and a reboot is being issued. |
+| `True` | `RebootCooldown` | Drifting machine(s) were rebooted recently and are waiting out the cooldown. |
+| `False` | `AllMachinesUpToDate` | All machines are running the target config. |
+
+**Observing:**
+
+```bash
+kubectl describe omnicluster my-cluster -n omni-gitops-system
+
+kubectl get omnicluster my-cluster -n omni-gitops-system \
+  -o jsonpath='{.status.conditions}'
+
+# Last drift-remediation reboot attempt per machine
+kubectl get omnicluster my-cluster -n omni-gitops-system \
+  -o jsonpath='{.status.lastRebootTimes}'
+```
+
+Reboots also emit `RebootTriggered` / `RebootFailed` / `RebootCooldown` events on the
+`OmniCluster`.
+
+**Limitations:**
+
+- There is no opt-out flag yet — when drift is detected and the health gate passes, the reboot
+  is always automatic. If you need a manual maintenance window, don't push the config change
+  until you're ready for the rolling reboot.
+- Schematic-level changes (`machineExtensions`, `kernelArgs`) are written as Omni
+  `ExtensionsConfiguration` / `KernelArgs` resources, and Omni applies them through its own
+  upgrade flow. The drift-reboot path does not special-case them: if a schematic change leaves
+  a machine drifting in a way a plain reboot cannot resolve, the machine will surface under
+  `RebootCooldown` until Omni's upgrade completes.
+
+---
+
 ## Examples
 
 | File | Description |

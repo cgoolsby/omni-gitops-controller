@@ -258,6 +258,60 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestReconcileMachineSet_EvictionDeletesKernelArgs verifies that scaling a
+// machine set down deletes the evicted machine's KernelArgs resource, even
+// when spec.KernelArgs is still set, so the machine returns to the available
+// pool without custom kernel args.
+func TestReconcileMachineSet_EvictionDeletesKernelArgs(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-workers"
+	machineID := "machine-uuid-evict"
+
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+
+	spec := api.MachineSetSpec{
+		Replicas:   1,
+		KernelArgs: []string{"libata.force=noncq"},
+	}
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("reconcile with kernelArgs: %v", err)
+	}
+
+	// KernelArgs resource must exist.
+	kaMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, machineID, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.KernelArgs](ctx, st, kaMD); err != nil {
+		t.Fatalf("KernelArgs resource should exist after reconcile with args: %v", err)
+	}
+
+	// Scale down to 0 while still passing the same KernelArgs in the spec, so
+	// the deletion must come from the eviction path, not the prune-on-clear path.
+	spec.Replicas = 0
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("reconcile scale-down: %v", err)
+	}
+
+	// KernelArgs resource must be gone.
+	if _, err := safe.StateGet[*omnires.KernelArgs](ctx, st, kaMD); err == nil {
+		t.Errorf("KernelArgs resource should have been deleted for evicted machine %s", machineID)
+	} else if !state.IsNotFoundError(err) {
+		t.Fatalf("unexpected error checking deleted KernelArgs: %v", err)
+	}
+
+	// MachineSetNode must be gone.
+	nodeMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, machineID, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.MachineSetNode](ctx, st, nodeMD); err == nil {
+		t.Errorf("MachineSetNode should have been deleted for evicted machine %s", machineID)
+	} else if !state.IsNotFoundError(err) {
+		t.Fatalf("unexpected error checking deleted MachineSetNode: %v", err)
+	}
+}
+
 // TestReconcileMachineSet_PrunesExtensionsWhenEmpty verifies that when
 // spec.MachineExtensions is cleared, the ExtensionsConfiguration resource
 // for the machine set is deleted.

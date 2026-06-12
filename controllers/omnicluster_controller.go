@@ -333,6 +333,9 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
 				return nil, fmt.Errorf("cleanup patches for evicted machine %s: %w", machineID, err)
 			}
+			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
+				return nil, fmt.Errorf("cleanup kernel args for evicted machine %s: %w", machineID, err)
+			}
 		}
 		already = keep
 	}

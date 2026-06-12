@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"strings"
 	"time"
@@ -98,10 +99,15 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if err := r.OmniClient.EnsureCluster(ctx,
 		clusterName,
+		ownerOf(cluster),
 		cluster.Spec.KubernetesVersion,
 		cluster.Spec.TalosVersion,
 	); err != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "EnsureClusterFailed", err)
+		reason := "EnsureClusterFailed"
+		if goerrors.Is(err, ErrClusterOwnershipConflict) {
+			reason = "ClusterOwnershipConflict"
+		}
+		return r.setFailure(ctx, cluster, statusBefore, reason, err)
 	}
 
 	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
@@ -405,6 +411,17 @@ func (r *OmniClusterReconciler) applyConfigPatches(
 func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster *api.OmniCluster) error {
 	clusterName := cluster.Name
 
+	// Refuse to tear down an Omni cluster owned by a different OmniCluster CR
+	// (same name, different namespace): its machine sets, patches and secrets
+	// belong to that CR's lifecycle, not this one's.
+	if owner, ok, err := r.OmniClient.ClusterOwner(ctx, clusterName); err != nil {
+		return err
+	} else if ok && owner != ownerOf(cluster) {
+		log.FromContext(ctx).Info("WARNING: omni cluster is owned by another OmniCluster, skipping teardown",
+			"cluster", clusterName, "owner", owner, "thisOmniCluster", ownerOf(cluster))
+		return nil
+	}
+
 	// Delete the kubeconfig Secret(s) before tearing down Omni resources.
 	// Both naming formats are attempted in case the --argocd-clusters flag
 	// changed during the cluster's lifetime.
@@ -625,6 +642,12 @@ func (r *OmniClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// ownerOf returns the owner identity stamped on Omni Cluster resources for
+// this CR: "<namespace>/<name>".
+func ownerOf(cluster *api.OmniCluster) string {
+	return cluster.Namespace + "/" + cluster.Name
+}
 
 // selectRebootCandidate returns the first drifting machine whose last
 // drift-remediation reboot is absent or older than rebootCooldown, or nil if

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -501,7 +502,7 @@ func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
 	cpMachineID := "cp-uuid-1"
 	workerMachineID := "worker-uuid-1"
 
-	if err := c.EnsureCluster(ctx, clusterName, "v1.30.0", "v1.8.0"); err != nil {
+	if err := c.EnsureCluster(ctx, clusterName, "flux-system/"+clusterName, "v1.30.0", "v1.8.0"); err != nil {
 		t.Fatalf("ensure cluster: %v", err)
 	}
 	sets := []struct {
@@ -542,7 +543,7 @@ func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
 
 	// Status.AllocatedMachines is intentionally empty: this is the failure
 	// mode being fixed (CR deleted before status was ever populated).
-	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "flux-system"}}
 
 	if err := r.deleteOmniResources(ctx, cluster); err != nil {
 		t.Fatalf("deleteOmniResources: %v", err)
@@ -567,6 +568,137 @@ func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
 		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, s.setID, resource.VersionUndefined), "MachineSet "+s.setID)
 	}
 	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined), "Cluster "+clusterName)
+}
+
+// ── EnsureCluster ownership tests ─────────────────────────────────────────────
+
+// TestEnsureCluster_SameOwnerUpdates verifies that the CR that created an Omni
+// cluster can keep reconciling it: repeat calls with the same owner succeed
+// and version changes propagate.
+func TestEnsureCluster_SameOwnerUpdates(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+	owner := "ns-a/prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.31.0", "v1.9.0"); err != nil {
+		t.Fatalf("update cluster with same owner: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, err := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if err != nil {
+		t.Fatalf("read back cluster: %v", err)
+	}
+	if got := stored.TypedSpec().Value.KubernetesVersion; got != "v1.31.0" {
+		t.Errorf("kubernetes version not updated: got %s, want v1.31.0", got)
+	}
+	if got := stored.TypedSpec().Value.TalosVersion; got != "v1.9.0" {
+		t.Errorf("talos version not updated: got %s, want v1.9.0", got)
+	}
+	if got, ok := stored.Metadata().Labels().Get(ownerLabel); !ok || got != owner {
+		t.Errorf("owner label = %q (present=%v), want %q", got, ok, owner)
+	}
+}
+
+// TestEnsureCluster_DifferentOwnerRefused verifies that a second OmniCluster CR
+// with the same name in another namespace cannot adopt — or modify — an Omni
+// cluster owned by the first CR.
+func TestEnsureCluster_DifferentOwnerRefused(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, "ns-a/prod", "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+
+	err := c.EnsureCluster(ctx, clusterName, "ns-b/prod", "v1.31.0", "v1.9.0")
+	if err == nil {
+		t.Fatal("expected ownership conflict error, got nil")
+	}
+	if !errors.Is(err, ErrClusterOwnershipConflict) {
+		t.Errorf("expected error wrapping ErrClusterOwnershipConflict, got: %v", err)
+	}
+
+	// The foreign CR's versions must not have been applied.
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, getErr := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if getErr != nil {
+		t.Fatalf("read back cluster: %v", getErr)
+	}
+	if got := stored.TypedSpec().Value.KubernetesVersion; got != "v1.30.0" {
+		t.Errorf("kubernetes version changed by non-owner: got %s, want v1.30.0", got)
+	}
+	if got, _ := stored.Metadata().Labels().Get(ownerLabel); got != "ns-a/prod" {
+		t.Errorf("owner label changed by non-owner: got %q, want ns-a/prod", got)
+	}
+}
+
+// TestEnsureCluster_AdoptsUnlabelledCluster verifies that an Omni cluster with
+// no owner label (pre-dating the controller or created by hand) is adopted and
+// stamped with the caller's owner identity.
+func TestEnsureCluster_AdoptsUnlabelledCluster(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+	owner := "ns-a/prod"
+
+	preexisting := omnires.NewCluster(clusterName)
+	preexisting.TypedSpec().Value.KubernetesVersion = "v1.30.0"
+	preexisting.TypedSpec().Value.TalosVersion = "v1.8.0"
+	if err := st.Create(ctx, preexisting); err != nil {
+		t.Fatalf("pre-create unlabelled cluster: %v", err)
+	}
+
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("EnsureCluster should adopt unlabelled cluster: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, err := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if err != nil {
+		t.Fatalf("read back cluster: %v", err)
+	}
+	if got, ok := stored.Metadata().Labels().Get(ownerLabel); !ok || got != owner {
+		t.Errorf("owner label after adoption = %q (present=%v), want %q", got, ok, owner)
+	}
+}
+
+// TestDeleteOmniResources_SkipsForeignOwnedCluster verifies that deleting an
+// OmniCluster CR does not tear down an Omni cluster owned by a different CR
+// with the same name in another namespace.
+func TestDeleteOmniResources_SkipsForeignOwnedCluster(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, "ns-a/prod", "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	foreignCR := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "ns-b"}}
+
+	if err := r.deleteOmniResources(ctx, foreignCR); err != nil {
+		t.Fatalf("deleteOmniResources should skip foreign-owned cluster without error: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.Cluster](ctx, st, md); err != nil {
+		t.Errorf("foreign-owned cluster should still exist after skipped teardown: %v", err)
+	}
 }
 
 // ── GetDriftingMachines tests ──────────────────────────────────────────────────

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -104,13 +105,30 @@ type ClusterStatus struct {
 	Ready bool // true when Omni reports kubernetesAPIReady
 }
 
-// EnsureCluster creates or updates the Omni Cluster resource.
-func (c *OmniClient) EnsureCluster(ctx context.Context, name, kubeVersion, talosVersion string) error {
+// ownerLabel records which OmniCluster CR (<namespace>/<name>) manages an Omni
+// Cluster resource, so two CRs with the same name in different namespaces
+// cannot silently adopt — and fight over — the same Omni cluster.
+const ownerLabel = "omni.gitops.dev/owner"
+
+// ErrClusterOwnershipConflict is wrapped into the error returned by
+// EnsureCluster when the Omni cluster is already owned by a different
+// OmniCluster CR. Detect it with errors.Is.
+var ErrClusterOwnershipConflict = errors.New("omni cluster ownership conflict")
+
+// EnsureCluster creates or updates the Omni Cluster resource. owner is the
+// <namespace>/<name> of the OmniCluster CR driving this call.
+//
+// An existing cluster whose ownerLabel matches owner is updated as usual. A
+// cluster without the label (pre-dating this controller or created by hand) is
+// adopted: the label is stamped onto it. A cluster owned by a different CR is
+// left untouched and an error wrapping ErrClusterOwnershipConflict is returned.
+func (c *OmniClient) EnsureCluster(ctx context.Context, name, owner, kubeVersion, talosVersion string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, name, resource.VersionUndefined)
 	existing, err := safe.StateGet[*omnires.Cluster](ctx, c.state, md)
 
 	if state.IsNotFoundError(err) {
 		cluster := omnires.NewCluster(name)
+		cluster.Metadata().Labels().Set(ownerLabel, owner)
 		cluster.TypedSpec().Value.KubernetesVersion = kubeVersion
 		cluster.TypedSpec().Value.TalosVersion = talosVersion
 		return c.state.Create(ctx, cluster)
@@ -119,13 +137,41 @@ func (c *OmniClient) EnsureCluster(ctx context.Context, name, kubeVersion, talos
 		return fmt.Errorf("get cluster: %w", err)
 	}
 
+	currentOwner, hasOwner := existing.Metadata().Labels().Get(ownerLabel)
+	if hasOwner && currentOwner != owner {
+		return fmt.Errorf("%w: omni cluster %q is owned by %s, refusing to adopt (this OmniCluster is %s)",
+			ErrClusterOwnershipConflict, name, currentOwner, owner)
+	}
+
+	needsUpdate := !hasOwner
+	if !hasOwner {
+		existing.Metadata().Labels().Set(ownerLabel, owner)
+	}
 	if existing.TypedSpec().Value.KubernetesVersion != kubeVersion ||
 		existing.TypedSpec().Value.TalosVersion != talosVersion {
 		existing.TypedSpec().Value.KubernetesVersion = kubeVersion
 		existing.TypedSpec().Value.TalosVersion = talosVersion
+		needsUpdate = true
+	}
+	if needsUpdate {
 		return c.state.Update(ctx, existing)
 	}
 	return nil
+}
+
+// ClusterOwner returns the ownerLabel value on the Omni Cluster resource.
+// ok is false when the cluster does not exist or carries no owner label.
+func (c *OmniClient) ClusterOwner(ctx context.Context, clusterName string) (owner string, ok bool, err error) {
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	existing, err := safe.StateGet[*omnires.Cluster](ctx, c.state, md)
+	if state.IsNotFoundError(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get cluster %s: %w", clusterName, err)
+	}
+	owner, ok = existing.Metadata().Labels().Get(ownerLabel)
+	return owner, ok, nil
 }
 
 // EnsureMachineSet creates the named MachineSet in Omni if it does not already exist.

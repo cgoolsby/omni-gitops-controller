@@ -415,6 +415,10 @@ This will leave Omni resources orphaned — clean them up manually in the Omni U
 3. Make your changes. Keep diffs surgical — touch only what the change requires.
 4. Open a pull request against `main` on [GitHub Issues](https://github.com/cgoolsby/omni-gitops-controller/issues).
 
+Note: the Helm chart's `version` and `appVersion` are kept identical and are
+bumped together to the tag version by the release workflow — don't bump them
+manually in PRs.
+
 ---
 
 ## License

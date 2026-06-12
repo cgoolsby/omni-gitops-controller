@@ -13,7 +13,13 @@ import (
 	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	omniresources "github.com/siderolabs/omni/client/pkg/omni/resources"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/cgoolsby/omni-gitops-controller/api/v1alpha1"
 )
@@ -296,5 +302,57 @@ func TestReconcileMachineSet_PrunesExtensionsWhenEmpty(t *testing.T) {
 		t.Errorf("ExtensionsConfiguration should have been deleted when spec.MachineExtensions is empty")
 	} else if !state.IsNotFoundError(err) {
 		t.Fatalf("unexpected error checking deleted ExtensionsConfiguration: %v", err)
+	}
+}
+
+// ── deleteOmniResources tests ──────────────────────────────────────────────────
+
+// TestDeleteOmniResources_DeletesKubeconfigSecrets verifies that deleting an
+// OmniCluster removes both the Flux-format and ArgoCD-format kubeconfig
+// Secrets, and that a missing Secret is tolerated.
+func TestDeleteOmniResources_DeletesKubeconfigSecrets(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+
+	namespace := "flux-system"
+	clusterName := "test-cluster"
+
+	fluxSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-kubeconfig", Namespace: namespace},
+	}
+	argoSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-cluster-secret", Namespace: namespace},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(fluxSecret, argoSecret).Build()
+
+	r := &OmniClusterReconciler{
+		Client:              kubeClient,
+		OmniClient:          c,
+		KubeconfigNamespace: namespace,
+	}
+
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources: %v", err)
+	}
+
+	for _, name := range []string{clusterName + "-kubeconfig", clusterName + "-cluster-secret"} {
+		err := kubeClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &corev1.Secret{})
+		if err == nil {
+			t.Errorf("secret %s should have been deleted", name)
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatalf("unexpected error getting secret %s: %v", name, err)
+		}
+	}
+
+	// A second run with no Secrets present must tolerate NotFound.
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources with no secrets: %v", err)
 	}
 }

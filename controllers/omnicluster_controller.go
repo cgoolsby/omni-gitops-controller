@@ -39,7 +39,7 @@ type OmniClusterReconciler struct {
 // +kubebuilder:rbac:groups=omni.gitops.dev,resources=omniclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=omni.gitops.dev,resources=omniclusters/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=omni.gitops.dev,resources=omniclusters/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 
 func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -333,6 +333,18 @@ func (r *OmniClusterReconciler) applyConfigPatches(
 // deleteOmniResources tears down all Omni resources for this cluster in reverse order.
 func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster *api.OmniCluster) error {
 	clusterName := cluster.Name
+
+	// Delete the kubeconfig Secret(s) before tearing down Omni resources.
+	// Both naming formats are attempted in case the --argocd-clusters flag
+	// changed during the cluster's lifetime.
+	for _, name := range []string{clusterName + "-kubeconfig", clusterName + "-cluster-secret"} {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.KubeconfigNamespace},
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, secret)); err != nil {
+			return fmt.Errorf("delete kubeconfig secret %s: %w", name, err)
+		}
+	}
 
 	// Remove all MachineSetNodes first (machines release back to available pool).
 	for machineSetID, machines := range cluster.Status.AllocatedMachines {

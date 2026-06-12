@@ -222,12 +222,15 @@ Flux can immediately target the cluster using a `Kustomization` with
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `status.observedGeneration` | `int64` | The `.metadata.generation` last processed by the controller. Set on both success and failure paths; conditions carry the success/failure signal. |
 | `status.phase` | `string` | Mirrors the Omni ClusterStatus phase: `ScalingUp`, `Running`, `ScalingDown`, `Destroying`, `Failed`. |
 | `status.ready` | `bool` | `true` when Omni reports the cluster as `Running` and the Kubernetes API is reachable. |
 | `status.allocatedMachines` | `map[string][]string` | Machine UUIDs bound to this cluster, keyed by MachineSet ID. Used to detect drift on re-reconcile. |
+| `status.lastRebootTimes` | `map[string]Time` | When the controller last issued a drift-remediation reboot for each machine, keyed by machine UUID. Enforces the reboot cooldown (see [Config Drift Detection](#config-drift-detection)). |
 | `status.failureReason` | `string` | Short machine-readable token when `phase` is `Failed`, e.g. `EnsureClusterFailed`. |
 | `status.failureMessage` | `string` | Human-readable error description when `phase` is `Failed`. |
-| `status.conditions[]` | `[]metav1.Condition` | Standard Kubernetes condition set. Condition types include `Ready`, `ClusterProvisioned`, `MachinesAllocated`, `KubeconfigWritten`. |
+| `status.conditions[Ready]` | `metav1.Condition` | `True` when Omni reports the cluster `Running` and the Kubernetes API is reachable. The reason mirrors the Omni phase (e.g. `Running`, `ScalingUp`), or is a failure reason (e.g. `EnsureClusterFailed`) when reconcile fails. |
+| `status.conditions[ConfigDriftDetected]` | `metav1.Condition` | `True` with reason `PendingReboot` or `RebootCooldown` when machines are drifting; `False` with reason `AllMachinesUpToDate` when all machines run the target config. See [Config Drift Detection](#config-drift-detection). |
 
 ---
 

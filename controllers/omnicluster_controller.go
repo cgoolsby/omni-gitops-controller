@@ -394,7 +394,11 @@ func (r *OmniClusterReconciler) applyConfigPatches(
 	return nil
 }
 
-// deleteOmniResources tears down all Omni resources for this cluster in reverse order.
+// deleteOmniResources tears down all Omni resources for this cluster in reverse
+// order. Teardown is driven entirely by Omni state (the authoritative source)
+// rather than status.AllocatedMachines, which can be empty or stale — e.g. when
+// the CR is deleted before its first successful reconcile or after a partially
+// failed one. status.AllocatedMachines remains informational only.
 func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster *api.OmniCluster) error {
 	clusterName := cluster.Name
 
@@ -410,12 +414,37 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 		}
 	}
 
-	// Remove all MachineSetNodes first (machines release back to available pool).
-	for machineSetID, machines := range cluster.Status.AllocatedMachines {
+	machineSetIDs, err := r.OmniClient.ListMachineSetIDsForCluster(ctx, clusterName)
+	if err != nil {
+		return fmt.Errorf("list machine sets for cluster %s: %w", clusterName, err)
+	}
+
+	// Remove all MachineSetNodes first (machines release back to available
+	// pool), along with each machine's ConfigPatches and KernelArgs so the
+	// machine doesn't carry stale customisation into the next cluster that
+	// allocates it. DeleteMachineSetNode returns an error while teardown is in
+	// progress, which makes controller-runtime requeue and retry.
+	for _, machineSetID := range machineSetIDs {
+		machines, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+		if err != nil {
+			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
+		}
 		for _, machineID := range machines {
 			if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
 				return fmt.Errorf("delete machine set node %s: %w", machineID, err)
 			}
+			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
+				return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
+			}
+			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
+				return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+			}
+		}
+	}
+
+	for _, machineSetID := range machineSetIDs {
+		if err := r.OmniClient.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+			return fmt.Errorf("delete extensions configuration for machine set %s: %w", machineSetID, err)
 		}
 		if err := r.OmniClient.DeleteMachineSet(ctx, machineSetID); err != nil {
 			return fmt.Errorf("delete machine set %s: %w", machineSetID, err)

@@ -180,6 +180,23 @@ func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.Lab
 	return ids, nil
 }
 
+// ListMachineSetIDsForCluster returns the IDs of all Omni MachineSets labelled
+// with the given cluster.
+func (c *OmniClient) ListMachineSetIDsForCluster(ctx context.Context, clusterName string) ([]string, error) {
+	list, err := safe.StateListAll[*omnires.MachineSet](ctx, c.state,
+		state.WithLabelQuery(resource.LabelEqual(omnires.LabelCluster, clusterName)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list machine sets for %s: %w", clusterName, err)
+	}
+
+	var ids []string
+	list.ForEach(func(ms *omnires.MachineSet) {
+		ids = append(ids, ms.Metadata().ID())
+	})
+	return ids, nil
+}
+
 // AllocatedMachineSetNodes lists machine UUIDs already bound to a MachineSet.
 func (c *OmniClient) AllocatedMachineSetNodes(ctx context.Context, machineSetID string) ([]string, error) {
 	list, err := safe.StateListAll[*omnires.MachineSetNode](ctx, c.state,

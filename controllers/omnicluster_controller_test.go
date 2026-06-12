@@ -431,6 +431,90 @@ func TestDeleteOmniResources_DeletesKubeconfigSecrets(t *testing.T) {
 	}
 }
 
+// TestDeleteOmniResources_DrivenByOmniState verifies that finalizer teardown
+// discovers resources from Omni state (the authoritative source) rather than
+// status.AllocatedMachines, so a CR deleted with an empty or stale status map —
+// e.g. before its first successful reconcile — does not leak MachineSetNodes,
+// MachineSets, ConfigPatches, KernelArgs, or ExtensionsConfigurations in Omni.
+func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := clusterName + "-control-planes"
+	workerSetID := clusterName + "-workers"
+	cpMachineID := "cp-uuid-1"
+	workerMachineID := "worker-uuid-1"
+
+	if err := c.EnsureCluster(ctx, clusterName, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("ensure cluster: %v", err)
+	}
+	sets := []struct {
+		setID, machineID, role string
+	}{
+		{cpSetID, cpMachineID, omnires.LabelControlPlaneRole},
+		{workerSetID, workerMachineID, omnires.LabelWorkerRole},
+	}
+	for _, s := range sets {
+		if err := c.EnsureMachineSet(ctx, clusterName, s.setID, s.role); err != nil {
+			t.Fatalf("ensure machine set %s: %v", s.setID, err)
+		}
+		if err := c.EnsureMachineSetNode(ctx, clusterName, s.setID, s.machineID, s.role); err != nil {
+			t.Fatalf("ensure machine set node %s: %v", s.machineID, err)
+		}
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		inline := json.RawMessage(mustJSON(map[string]any{"machine": map[string]any{"install": map[string]any{"disk": "/dev/sda"}}}))
+		if err := c.EnsureConfigPatch(ctx, patchID, clusterName, s.setID, s.machineID, inline); err != nil {
+			t.Fatalf("ensure config patch %s: %v", patchID, err)
+		}
+		if err := c.EnsureMachineKernelArgs(ctx, s.machineID, []string{"libata.force=noncq"}); err != nil {
+			t.Fatalf("ensure kernel args %s: %v", s.machineID, err)
+		}
+		if err := c.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, s.setID, []string{"siderolabs/iscsi-tools"}); err != nil {
+			t.Fatalf("ensure extensions configuration %s: %v", s.setID, err)
+		}
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+	r := &OmniClusterReconciler{
+		Client:              fake.NewClientBuilder().WithScheme(scheme).Build(),
+		OmniClient:          c,
+		KubeconfigNamespace: "flux-system",
+	}
+
+	// Status.AllocatedMachines is intentionally empty: this is the failure
+	// mode being fixed (CR deleted before status was ever populated).
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources: %v", err)
+	}
+
+	assertGone := func(md resource.Metadata, desc string) {
+		t.Helper()
+		_, err := st.Get(ctx, md)
+		if err == nil {
+			t.Errorf("%s should have been deleted but still exists", desc)
+		} else if !state.IsNotFoundError(err) {
+			t.Fatalf("unexpected error checking %s: %v", desc, err)
+		}
+	}
+
+	for _, s := range sets {
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, s.machineID, resource.VersionUndefined), "MachineSetNode "+s.machineID)
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, patchID, resource.VersionUndefined), "ConfigPatch "+patchID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, s.machineID, resource.VersionUndefined), "KernelArgs "+s.machineID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+s.setID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+s.setID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, s.setID, resource.VersionUndefined), "MachineSet "+s.setID)
+	}
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined), "Cluster "+clusterName)
+}
+
 // ── GetDriftingMachines tests ──────────────────────────────────────────────────
 
 // createClusterMachineStatus inserts a ClusterMachineStatus fixture into the

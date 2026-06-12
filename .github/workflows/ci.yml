@@ -24,6 +24,20 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test -v -race ./...
+
   crd-drift:
     name: CRD Drift Check
     runs-on: ubuntu-latest

@@ -34,6 +34,22 @@ omni:
   # When set, a ConfigMap is created and SSL_CERT_FILE is set in the container.
   caCert: ""
 
+# Prometheus metrics exposure.
+metrics:
+  # Create a Service exposing the metrics port (8080).
+  enabled: true
+  serviceMonitor:
+    # Create a ServiceMonitor for Prometheus Operator. Requires metrics.enabled.
+    enabled: false
+    # Namespace for the ServiceMonitor. Defaults to the controller namespace.
+    namespace: ""
+    # Extra labels for the ServiceMonitor, e.g. to match a Prometheus selector.
+    additionalLabels: {}
+    # Scrape interval.
+    interval: 30s
+    # Scrape timeout.
+    scrapeTimeout: 10s
+
 serviceAccount:
   create: true
   name: ""

@@ -10,7 +10,9 @@ import (
 
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
@@ -57,6 +59,11 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Snapshot status so the write at the end can be skipped when nothing
+	// changed: an unconditional status update fires a watch event on our own
+	// CR, which would retrigger reconcile in a tight loop.
+	statusBefore := cluster.Status.DeepCopy()
+
 	// ── Delete path ───────────────────────────────────────────────────────────
 	if !cluster.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(cluster, finalizerName) {
@@ -88,12 +95,12 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		cluster.Spec.KubernetesVersion,
 		cluster.Spec.TalosVersion,
 	); err != nil {
-		return r.setFailure(ctx, cluster, "EnsureClusterFailed", err)
+		return r.setFailure(ctx, cluster, statusBefore, "EnsureClusterFailed", err)
 	}
 
 	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
 	if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, cpMachineSetID, omnires.LabelControlPlaneRole); err != nil {
-		return r.setFailure(ctx, cluster, "EnsureMachineSetFailed", err)
+		return r.setFailure(ctx, cluster, statusBefore, "EnsureMachineSetFailed", err)
 	}
 
 	allocatedMachines := map[string][]string{}
@@ -101,7 +108,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// Allocate control plane machines.
 	if allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, cpMachineSetID,
 		omnires.LabelControlPlaneRole, cluster.Spec.ControlPlane); err != nil {
-		return r.setFailure(ctx, cluster, "AllocateCPMachinesFailed", err)
+		return r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
 	} else {
 		allocatedMachines[cpMachineSetID] = allocated
 	}
@@ -110,11 +117,11 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	for _, w := range cluster.Spec.Workers {
 		wID := fmt.Sprintf("%s-%s", clusterName, w.Name)
 		if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, wID, omnires.LabelWorkerRole); err != nil {
-			return r.setFailure(ctx, cluster, "EnsureWorkerMachineSetFailed", err)
+			return r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
 		}
 		if allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, wID,
 			omnires.LabelWorkerRole, w.MachineSetSpec); err != nil {
-			return r.setFailure(ctx, cluster, "AllocateWorkerMachinesFailed", err)
+			return r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
 		} else {
 			allocatedMachines[wID] = allocated
 		}
@@ -123,7 +130,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// ── Update status from Omni ───────────────────────────────────────────────
 	omniStatus, err := r.OmniClient.GetClusterStatus(ctx, clusterName)
 	if err != nil {
-		return r.setFailure(ctx, cluster, "GetStatusFailed", err)
+		return r.setFailure(ctx, cluster, statusBefore, "GetStatusFailed", err)
 	}
 
 	// Detect config drift only when the cluster is ready (machines must be Running).
@@ -131,7 +138,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if omniStatus.Ready {
 		drifting, err = r.OmniClient.GetDriftingMachines(ctx, clusterName)
 		if err != nil {
-			return r.setFailure(ctx, cluster, "ConfigDriftCheckFailed", err)
+			return r.setFailure(ctx, cluster, statusBefore, "ConfigDriftCheckFailed", err)
 		}
 	}
 
@@ -140,12 +147,12 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	cluster.Status.AllocatedMachines = allocatedMachines
 	cluster.Status.FailureReason = nil
 	cluster.Status.FailureMessage = nil
-	setCondition(&cluster.Status.Conditions, metav1.Condition{
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
 		Status:             boolToConditionStatus(omniStatus.Ready),
 		Reason:             omniStatus.Phase,
 		Message:            fmt.Sprintf("Omni cluster phase: %s", omniStatus.Phase),
-		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: cluster.Generation,
 	})
 
 	// Prune reboot bookkeeping for machines no longer allocated to this cluster.
@@ -164,20 +171,20 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	now := metav1.Now()
 	var rebootCandidate *MachineConfigDrift
 	if len(drifting) == 0 {
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               "ConfigDriftDetected",
 			Status:             metav1.ConditionFalse,
 			Reason:             "AllMachinesUpToDate",
 			Message:            "All machines are running the target config",
-			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: cluster.Generation,
 		})
 	} else if rebootCandidate = selectRebootCandidate(drifting, cluster.Status.LastRebootTimes, now.Time); rebootCandidate != nil {
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               "ConfigDriftDetected",
 			Status:             metav1.ConditionTrue,
 			Reason:             "PendingReboot",
 			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", rebootCandidate.MachineID),
-			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: cluster.Generation,
 		})
 		// Record the attempt time before issuing the reboot: even if the RPC
 		// later fails, the machine should not be hammered every cycle.
@@ -190,17 +197,19 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		for _, d := range drifting {
 			waiting = append(waiting, d.MachineID)
 		}
-		setCondition(&cluster.Status.Conditions, metav1.Condition{
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               "ConfigDriftDetected",
 			Status:             metav1.ConditionTrue,
 			Reason:             "RebootCooldown",
 			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
-			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: cluster.Generation,
 		})
 	}
 
-	if err := r.Status().Update(ctx, cluster); err != nil {
-		return ctrl.Result{}, err
+	if statusNeedsUpdate(statusBefore, &cluster.Status) {
+		if err := r.Status().Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if !omniStatus.Ready {
@@ -215,7 +224,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
 	}
 	if kubeconfigErr != nil {
-		return r.setFailure(ctx, cluster, "EnsureKubeconfigFailed", kubeconfigErr)
+		return r.setFailure(ctx, cluster, statusBefore, "EnsureKubeconfigFailed", kubeconfigErr)
 	}
 
 	// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
@@ -410,20 +419,24 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 	return r.OmniClient.DeleteCluster(ctx, clusterName)
 }
 
-// setFailure updates status with a failure reason and requeues.
-func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.OmniCluster, reason string, err error) (ctrl.Result, error) {
+// setFailure updates status with a failure reason and requeues. The write is
+// skipped when status is unchanged from statusBefore so repeated failures do
+// not retrigger reconcile through our own watch.
+func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.OmniCluster, statusBefore *api.OmniClusterStatus, reason string, err error) (ctrl.Result, error) {
 	msg := err.Error()
 	cluster.Status.Ready = false
 	cluster.Status.FailureReason = &reason
 	cluster.Status.FailureMessage = &msg
-	setCondition(&cluster.Status.Conditions, metav1.Condition{
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 		Type:               "Ready",
 		Status:             metav1.ConditionFalse,
 		Reason:             reason,
 		Message:            msg,
-		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: cluster.Generation,
 	})
-	_ = r.Status().Update(ctx, cluster)
+	if statusNeedsUpdate(statusBefore, &cluster.Status) {
+		_ = r.Status().Update(ctx, cluster)
+	}
 	return ctrl.Result{RequeueAfter: requeueShort}, err
 }
 
@@ -534,14 +547,12 @@ func selectRebootCandidate(drifting []MachineConfigDrift, lastReboots map[string
 	return nil
 }
 
-func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
-	for i, c := range *conditions {
-		if c.Type == cond.Type {
-			(*conditions)[i] = cond
-			return
-		}
-	}
-	*conditions = append(*conditions, cond)
+// statusNeedsUpdate reports whether the status changed during this reconcile
+// and therefore needs to be written back to the API server. Skipping no-op
+// writes matters because the controller watches its own CR: every status
+// write fires a watch event that retriggers reconcile immediately.
+func statusNeedsUpdate(before, after *api.OmniClusterStatus) bool {
+	return !equality.Semantic.DeepEqual(before, after)
 }
 
 func boolToConditionStatus(b bool) metav1.ConditionStatus {

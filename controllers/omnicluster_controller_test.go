@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -572,4 +573,79 @@ func TestSelectRebootCandidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ── statusNeedsUpdate tests ───────────────────────────────────────────────────
+
+// TestStatusNeedsUpdate verifies the conditional-update decision that breaks
+// the watch-driven hot loop: re-deriving an identical status (including
+// conditions re-set via meta.SetStatusCondition) must not trigger a write,
+// while any real change must.
+func TestStatusNeedsUpdate(t *testing.T) {
+	transition := metav1.NewTime(time.Now().Add(-time.Hour).Truncate(time.Second))
+	baseStatus := func() *api.OmniClusterStatus {
+		return &api.OmniClusterStatus{
+			Phase: "Running",
+			Ready: true,
+			AllocatedMachines: map[string][]string{
+				"cp": {"machine-a"},
+			},
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Running",
+				Message:            "Omni cluster phase: Running",
+				LastTransitionTime: transition,
+			}},
+		}
+	}
+
+	t.Run("identical status needs no update", func(t *testing.T) {
+		if statusNeedsUpdate(baseStatus(), baseStatus()) {
+			t.Error("expected no update for identical statuses")
+		}
+	})
+
+	t.Run("re-setting an unchanged condition needs no update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		meta.SetStatusCondition(&after.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionTrue,
+			Reason:  "Running",
+			Message: "Omni cluster phase: Running",
+		})
+		if statusNeedsUpdate(before, after) {
+			t.Error("expected no update when condition is re-set with identical values")
+		}
+		if !after.Conditions[0].LastTransitionTime.Equal(&transition) {
+			t.Errorf("LastTransitionTime changed without a transition: %v", after.Conditions[0].LastTransitionTime)
+		}
+	})
+
+	t.Run("condition transition needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		meta.SetStatusCondition(&after.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionFalse,
+			Reason:  "ScalingUp",
+			Message: "Omni cluster phase: ScalingUp",
+		})
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when condition status transitions")
+		}
+		if after.Conditions[0].LastTransitionTime.Equal(&transition) {
+			t.Error("LastTransitionTime should be re-stamped on a transition")
+		}
+	})
+
+	t.Run("field change needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		after.Phase = "Destroying"
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when a status field changes")
+		}
+	})
 }

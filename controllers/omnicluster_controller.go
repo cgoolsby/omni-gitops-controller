@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -87,6 +88,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			if err := r.deleteOmniResources(ctx, cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete omni resources: %w", err)
 			}
+			deleteClusterMetrics(cluster.Name, cluster.Namespace)
 			controllerutil.RemoveFinalizer(cluster, finalizerName)
 			if err := r.Update(ctx, cluster); err != nil {
 				return ctrl.Result{}, err
@@ -162,6 +164,18 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setFailure(ctx, cluster, statusBefore, "GetStatusFailed", err)
 	}
 
+	clusterReadyGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(omniStatus.Ready))
+
+	// Reset the per-machineset series before re-setting them so machine sets
+	// removed from spec do not linger as stale series.
+	clusterMachinesAllocatedGauge.DeletePartialMatch(prometheus.Labels{
+		"name":      cluster.Name,
+		"namespace": cluster.Namespace,
+	})
+	for machineSetID, machines := range allocatedMachines {
+		clusterMachinesAllocatedGauge.WithLabelValues(cluster.Name, cluster.Namespace, machineSetID).Set(float64(len(machines)))
+	}
+
 	// Detect config drift only when the cluster is ready (machines must be Running).
 	var drifting []MachineConfigDrift
 	if omniStatus.Ready {
@@ -170,6 +184,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return r.setFailure(ctx, cluster, statusBefore, "ConfigDriftCheckFailed", err)
 		}
 	}
+	clusterConfigDriftGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(len(drifting) > 0))
 
 	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Phase = omniStatus.Phase
@@ -279,6 +294,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.Error(err, "Failed to reboot machine", "machine", rebootCandidate.MachineID)
 			r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
 		} else {
+			machineRebootsTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
 			r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
 				"Rebooting machine %s to apply config update", rebootCandidate.MachineID)
 		}

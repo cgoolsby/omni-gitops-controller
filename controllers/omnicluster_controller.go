@@ -297,6 +297,15 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 				log.FromContext(ctx).Info("WARNING: even number of control-plane replicas loses etcd quorum margin",
 					"replicas", spec.Replicas)
 			}
+			// Remove at most one control-plane member per reconcile. Evicting
+			// several etcd members at once (e.g. scaling 5 → 3) risks quorum
+			// loss while Omni is still tearing down the first member. The
+			// periodic RequeueAfter picks up the next removal on a later
+			// cycle, and DeleteMachineSetNode errors while teardown is in
+			// progress, so each member is fully removed before the next one.
+			if toRemove > 1 {
+				toRemove = 1
+			}
 		}
 
 		evict := already[len(already)-toRemove:]

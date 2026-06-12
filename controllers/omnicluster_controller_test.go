@@ -200,9 +200,9 @@ func TestApplyConfigPatches_PrunesRemoved(t *testing.T) {
 
 // setupAllocatedMachine pre-creates a MachineSetNode in the in-memory state so
 // that AllocatedMachineSetNodes returns it without needing a real Omni server.
-func setupAllocatedMachine(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID string) {
+func setupAllocatedMachine(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID, role string) {
 	t.Helper()
-	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, role); err != nil {
 		t.Fatalf("pre-create MachineSetNode: %v", err)
 	}
 }
@@ -218,7 +218,7 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 	machineSetID := "test-cluster-workers"
 	machineID := "machine-uuid-4"
 
-	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID)
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
 
 	r := &OmniClusterReconciler{OmniClient: c}
 
@@ -269,7 +269,7 @@ func TestReconcileMachineSet_PrunesExtensionsWhenEmpty(t *testing.T) {
 	machineSetID := "test-cluster-workers"
 	machineID := "machine-uuid-5"
 
-	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID)
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
 
 	r := &OmniClusterReconciler{OmniClient: c}
 
@@ -304,6 +304,77 @@ func TestReconcileMachineSet_PrunesExtensionsWhenEmpty(t *testing.T) {
 		t.Errorf("ExtensionsConfiguration should have been deleted when spec.MachineExtensions is empty")
 	} else if !state.IsNotFoundError(err) {
 		t.Fatalf("unexpected error checking deleted ExtensionsConfiguration: %v", err)
+	}
+}
+
+// ── reconcileMachineSet scale-down tests ──────────────────────────────────────
+
+// TestReconcileMachineSet_ControlPlaneScaleDownOneAtATime verifies that
+// control-plane scale-down removes at most one member per reconcile, so a
+// 3 → 1 scale takes two reconcile cycles instead of evicting two etcd
+// members at once.
+func TestReconcileMachineSet_ControlPlaneScaleDownOneAtATime(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-control-planes"
+
+	for i := 1; i <= 3; i++ {
+		setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, fmt.Sprintf("cp-uuid-%d", i), omnires.LabelControlPlaneRole)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	spec := api.MachineSetSpec{Replicas: 1}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelControlPlaneRole, spec); err != nil {
+		t.Fatalf("first scale-down reconcile: %v", err)
+	}
+	remaining, err := c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after first reconcile: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("after first reconcile: got %d machines, want 2 (one member removed per cycle)", len(remaining))
+	}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelControlPlaneRole, spec); err != nil {
+		t.Fatalf("second scale-down reconcile: %v", err)
+	}
+	remaining, err = c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after second reconcile: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Errorf("after second reconcile: got %d machines, want 1", len(remaining))
+	}
+}
+
+// TestReconcileMachineSet_WorkerScaleDownBatch verifies that worker
+// scale-down still removes all excess machines in a single reconcile.
+func TestReconcileMachineSet_WorkerScaleDownBatch(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-workers"
+
+	for i := 1; i <= 3; i++ {
+		setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, fmt.Sprintf("worker-uuid-%d", i), omnires.LabelWorkerRole)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	spec := api.MachineSetSpec{Replicas: 1}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("scale-down reconcile: %v", err)
+	}
+	remaining, err := c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after reconcile: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Errorf("after reconcile: got %d machines, want 1 (workers scale down in one batch)", len(remaining))
 	}
 }
 

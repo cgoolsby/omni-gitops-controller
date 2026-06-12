@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# fable5/run.sh — execute the fable5 prompt series one at a time on a branch,
+# fable5/run.sh — execute a prompt series one at a time on a branch,
 # gating each step on build/tests, committing per prompt, and opening a PR.
 #
-# Safe to re-run: prompts that already produced a commit on the branch are skipped.
+# Reusable for other series: set PROMPT_DIR to a directory of NN-*.md prompts
+# (see fable6/run.sh). Safe to re-run: prompts that already produced a commit
+# on the branch are skipped.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+PROMPT_DIR="${PROMPT_DIR:-fable5}"
 BRANCH="${FABLE5_BRANCH:-fable5/lifecycle-review-fixes}"
+PR_BASE="${FABLE5_PR_BASE:-}"
+PR_TITLE="${FABLE5_PR_TITLE:-Node lifecycle hardening: reboot safety, status convergence, teardown correctness}"
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-LOG_DIR="${FABLE5_LOG_DIR:-$(mktemp -d /tmp/fable5-run.XXXXXX)}"
+LOG_DIR="${FABLE5_LOG_DIR:-$(mktemp -d "/tmp/${PROMPT_DIR}-run.XXXXXX")}"
 mkdir -p "$LOG_DIR"
 
 command -v "$CLAUDE_BIN" >/dev/null || { echo "error: claude CLI not found" >&2; exit 1; }
@@ -26,7 +31,7 @@ if [[ "${FABLE5_YOLO:-0}" == "1" ]]; then
 else
   # Single comma-separated value: --allowedTools is variadic and would otherwise
   # swallow the prompt argument.
-  CLAUDE_ARGS+=(--allowedTools "Bash(go:*),Bash(gofmt:*),Bash(controller-gen:*),Bash(cp:*),Bash(ls:*),Bash(cat:*),Bash(diff:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(grep:*),Bash(find:*)")
+  CLAUDE_ARGS+=(--allowedTools "Bash(go:*),Bash(gofmt:*),Bash(controller-gen:*),Bash(cp:*),Bash(ls:*),Bash(cat:*),Bash(diff:*),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git rm:*),Bash(grep:*),Bash(find:*),Bash(helm:*),Bash(make:*),Bash(python3:*)")
 fi
 
 run_claude() { # prompt text on stdin
@@ -61,26 +66,26 @@ fi
 
 # Refuse to start with unrelated uncommitted changes (metaPrompts/ is the user's
 # untracked scratch space and is always left alone).
-dirty="$(git status --porcelain | grep -v '^?? metaPrompts/' | grep -v '^?? fable5/' || true)"
+dirty="$(git status --porcelain | grep -v '^?? metaPrompts/' | grep -v "^?? $PROMPT_DIR/" | grep -v "^ M fable5/run.sh" || true)"
 if [[ -n "$dirty" ]]; then
   echo "error: working tree has uncommitted changes; commit or stash first:" >&2
   echo "$dirty" >&2
   exit 1
 fi
 
-# Commit the prompt series itself if not yet committed.
-if [[ -n "$(git status --porcelain -- fable5/)" ]]; then
-  git add fable5/
-  git commit -m "fable5: add lifecycle-review prompt series and runner"
+# Commit the prompt series itself (and any runner changes) if not yet committed.
+if [[ -n "$(git status --porcelain -- "$PROMPT_DIR/" fable5/run.sh)" ]]; then
+  git add "$PROMPT_DIR/" fable5/run.sh
+  git commit -m "$PROMPT_DIR: add prompt series and runner"
 fi
 
 echo "Logs: $LOG_DIR"
 
 # ── main loop ─────────────────────────────────────────────────────────────────
-for prompt_file in fable5/[0-9][0-9]-*.md; do
+for prompt_file in "$PROMPT_DIR"/[0-9][0-9]-*.md; do
   name="$(basename "$prompt_file" .md)"
 
-  if git log --oneline --fixed-strings --grep "fable5: apply $name" | grep -q .; then
+  if git log --oneline --fixed-strings --grep "$PROMPT_DIR: apply $name" | grep -q .; then
     echo "── $name: already applied, skipping"
     continue
   fi
@@ -109,12 +114,12 @@ $(tail -100 "$LOG_DIR/gate.log")"
 
   if [[ -z "$(git status --porcelain | grep -v '^?? metaPrompts/' || true)" ]]; then
     echo "── $name: no changes produced; recording as applied"
-    git commit --allow-empty -m "fable5: apply $name (no changes needed)"
+    git commit --allow-empty -m "$PROMPT_DIR: apply $name (no changes needed)"
     continue
   fi
 
   git add -A -- ':(exclude)metaPrompts'
-  git commit -m "fable5: apply $name" -m "Applied prompt $prompt_file; build/vet/test verified."
+  git commit -m "$PROMPT_DIR: apply $name" -m "Applied prompt $prompt_file; build/vet/test verified."
   echo "── $name: committed"
 done
 
@@ -129,12 +134,12 @@ fi
 
 pr_body="$LOG_DIR/pr-body.md"
 {
-  echo "Automated fix series from a node-lifecycle code review, applied prompt-by-prompt"
-  echo "(prompt files and runner are included under \`fable5/\`)."
+  echo "Automated fix series applied prompt-by-prompt"
+  echo "(prompt files and runner are included under \`$PROMPT_DIR/\`)."
   echo
   echo "## Changes"
   echo
-  for prompt_file in fable5/[0-9][0-9]-*.md; do
+  for prompt_file in "$PROMPT_DIR"/[0-9][0-9]-*.md; do
     title="$(head -1 "$prompt_file" | sed 's/^# *//')"
     echo "- **$(basename "$prompt_file" .md)** — ${title#Prompt [0-9][0-9] — }"
   done
@@ -143,6 +148,8 @@ pr_body="$LOG_DIR/pr-body.md"
   echo "committed individually, so the series can be reviewed commit-by-commit."
 } >"$pr_body"
 
-gh pr create \
-  --title "Node lifecycle hardening: reboot safety, status convergence, teardown correctness" \
-  --body-file "$pr_body"
+PR_CREATE_ARGS=(--title "$PR_TITLE" --body-file "$pr_body")
+if [[ -n "$PR_BASE" ]]; then
+  PR_CREATE_ARGS+=(--base "$PR_BASE")
+fi
+gh pr create "${PR_CREATE_ARGS[@]}"

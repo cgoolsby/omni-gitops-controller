@@ -73,6 +73,11 @@ type OmniClusterStatus struct {
 	// keyed by machine-set ID. Used to detect drift on re-reconcile.
 	// +optional
 	AllocatedMachines map[string][]string `json:"allocatedMachines,omitempty"`
+	// LastRebootTimes records when the controller last issued a drift-remediation
+	// reboot for each machine (keyed by machine UUID). Used to enforce a cooldown
+	// so a persistently-drifting machine is not rebooted in a loop.
+	// +optional
+	LastRebootTimes map[string]metav1.Time `json:"lastRebootTimes,omitempty"`
 	// FailureReason is a short machine-readable token when phase is Failed.
 	// +optional
 	FailureReason *string `json:"failureReason,omitempty"`

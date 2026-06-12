@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
@@ -25,6 +26,10 @@ const (
 	finalizerName = "omnicluster.omni.gitops.dev/finalizer"
 	requeueShort  = 15 * time.Second
 	requeueLong   = 60 * time.Second
+	// rebootCooldown is the minimum time between drift-remediation reboots of the
+	// same machine, so a machine whose drift persists across reboots is not
+	// rebooted in a loop every reconcile cycle.
+	rebootCooldown = 10 * time.Minute
 )
 
 // OmniClusterReconciler reconciles OmniCluster objects.
@@ -143,6 +148,21 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		LastTransitionTime: metav1.Now(),
 	})
 
+	// Prune reboot bookkeeping for machines no longer allocated to this cluster.
+	allocatedSet := map[string]bool{}
+	for _, ids := range allocatedMachines {
+		for _, id := range ids {
+			allocatedSet[id] = true
+		}
+	}
+	for id := range cluster.Status.LastRebootTimes {
+		if !allocatedSet[id] {
+			delete(cluster.Status.LastRebootTimes, id)
+		}
+	}
+
+	now := metav1.Now()
+	var rebootCandidate *MachineConfigDrift
 	if len(drifting) == 0 {
 		setCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               "ConfigDriftDetected",
@@ -151,12 +171,30 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			Message:            "All machines are running the target config",
 			LastTransitionTime: metav1.Now(),
 		})
-	} else {
+	} else if rebootCandidate = selectRebootCandidate(drifting, cluster.Status.LastRebootTimes, now.Time); rebootCandidate != nil {
 		setCondition(&cluster.Status.Conditions, metav1.Condition{
 			Type:               "ConfigDriftDetected",
 			Status:             metav1.ConditionTrue,
 			Reason:             "PendingReboot",
-			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", drifting[0].MachineID),
+			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", rebootCandidate.MachineID),
+			LastTransitionTime: metav1.Now(),
+		})
+		// Record the attempt time before issuing the reboot: even if the RPC
+		// later fails, the machine should not be hammered every cycle.
+		if cluster.Status.LastRebootTimes == nil {
+			cluster.Status.LastRebootTimes = map[string]metav1.Time{}
+		}
+		cluster.Status.LastRebootTimes[rebootCandidate.MachineID] = now
+	} else {
+		waiting := make([]string, 0, len(drifting))
+		for _, d := range drifting {
+			waiting = append(waiting, d.MachineID)
+		}
+		setCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionTrue,
+			Reason:             "RebootCooldown",
+			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
 			LastTransitionTime: metav1.Now(),
 		})
 	}
@@ -180,14 +218,14 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setFailure(ctx, cluster, "EnsureKubeconfigFailed", kubeconfigErr)
 	}
 
-	// Reboot the first drifting machine (rolling window = 1). The window is enforced by
+	// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
 	// GetDriftingMachines, which returns no candidates while any machine in the cluster is
 	// unhealthy — so a machine still rebooting from the previous cycle blocks further reboots.
-	if len(drifting) > 0 {
-		first := drifting[0]
-		logger.Info("Config drift detected, triggering reboot", "machine", first.MachineID, "addr", first.ManagementAddress)
-		if err := r.OmniClient.RebootMachine(ctx, clusterName, first.ManagementAddress); err != nil {
-			logger.Error(err, "Failed to reboot machine", "machine", first.MachineID)
+	// The attempt was already recorded in status above, before the RPC.
+	if rebootCandidate != nil {
+		logger.Info("Config drift detected, triggering reboot", "machine", rebootCandidate.MachineID, "addr", rebootCandidate.ManagementAddress)
+		if err := r.OmniClient.RebootMachine(ctx, clusterName, rebootCandidate.ManagementAddress); err != nil {
+			logger.Error(err, "Failed to reboot machine", "machine", rebootCandidate.MachineID)
 		}
 		return ctrl.Result{RequeueAfter: requeueLong}, nil
 	}
@@ -473,6 +511,19 @@ func (r *OmniClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+// selectRebootCandidate returns the first drifting machine whose last
+// drift-remediation reboot is absent or older than rebootCooldown, or nil if
+// every drifting machine is still cooling down.
+func selectRebootCandidate(drifting []MachineConfigDrift, lastReboots map[string]metav1.Time, now time.Time) *MachineConfigDrift {
+	for i := range drifting {
+		last, ok := lastReboots[drifting[i].MachineID]
+		if !ok || now.Sub(last.Time) >= rebootCooldown {
+			return &drifting[i]
+		}
+	}
+	return nil
+}
 
 func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) {
 	for i, c := range *conditions {

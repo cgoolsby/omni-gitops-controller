@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/safe"
@@ -436,6 +437,67 @@ func TestGetDriftingMachines_UnhealthyMachineBlocksReboots(t *testing.T) {
 			}
 			if len(drifting) != 0 {
 				t.Errorf("expected no reboot candidates while a machine is unhealthy, got %v", drifting)
+			}
+		})
+	}
+}
+
+// ── selectRebootCandidate tests ───────────────────────────────────────────────
+
+func TestSelectRebootCandidate(t *testing.T) {
+	now := time.Now()
+	machineA := MachineConfigDrift{MachineID: "machine-a", ManagementAddress: "10.0.0.1"}
+	machineB := MachineConfigDrift{MachineID: "machine-b", ManagementAddress: "10.0.0.2"}
+
+	cases := []struct {
+		name        string
+		drifting    []MachineConfigDrift
+		lastReboots map[string]metav1.Time
+		want        *MachineConfigDrift
+	}{
+		{
+			name:        "no prior reboot recorded returns first drifting machine",
+			drifting:    []MachineConfigDrift{machineA, machineB},
+			lastReboots: nil,
+			want:        &machineA,
+		},
+		{
+			name:     "machine in cooldown is skipped in favor of one with no record",
+			drifting: []MachineConfigDrift{machineA, machineB},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-1 * time.Minute)),
+			},
+			want: &machineB,
+		},
+		{
+			name:     "all drifting machines within cooldown returns nil",
+			drifting: []MachineConfigDrift{machineA, machineB},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-1 * time.Minute)),
+				"machine-b": metav1.NewTime(now.Add(-9 * time.Minute)),
+			},
+			want: nil,
+		},
+		{
+			name:     "reboot older than cooldown makes machine eligible again",
+			drifting: []MachineConfigDrift{machineA},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-rebootCooldown - time.Second)),
+			},
+			want: &machineA,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectRebootCandidate(tc.drifting, tc.lastReboots, now)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("expected no candidate, got %v", got)
+			case tc.want != nil && got == nil:
+				t.Errorf("expected candidate %s, got nil", tc.want.MachineID)
+			case tc.want != nil && got.MachineID != tc.want.MachineID:
+				t.Errorf("expected candidate %s, got %s", tc.want.MachineID, got.MachineID)
 			}
 		})
 	}

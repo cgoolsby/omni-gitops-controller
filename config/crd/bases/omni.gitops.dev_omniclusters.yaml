@@ -352,6 +352,15 @@ spec:
                 description: FailureReason is a short machine-readable token when
                   phase is Failed.
                 type: string
+              lastRebootTimes:
+                additionalProperties:
+                  format: date-time
+                  type: string
+                description: |-
+                  LastRebootTimes records when the controller last issued a drift-remediation
+                  reboot for each machine (keyed by machine UUID). Used to enforce a cooldown
+                  so a persistently-drifting machine is not rebooted in a loop.
+                type: object
               phase:
                 description: Phase mirrors the Omni ClusterStatus phase (ScalingUp,
                   Running, Destroying, etc.).

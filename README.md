@@ -186,7 +186,7 @@ Flux can immediately target the cluster using a `Kustomization` with
 | `spec.talosVersion` | `string` | yes | — | Target Talos Linux version, e.g. `"v1.9.0"`. Must include the `v` prefix. |
 | `spec.controlPlane` | `MachineSetSpec` | yes | — | Describes the control-plane machine set. |
 | `spec.controlPlane.replicas` | `int32` | no | `1` | Number of control-plane machines. Use `1` or an odd number ≥ 3 for etcd quorum. |
-| `spec.controlPlane.machineSelector` | `LabelSelector` | yes | — | Selects available Omni machines by label. Empty `matchLabels: {}` matches any available machine. |
+| `spec.controlPlane.machineSelector` | `LabelSelector` | yes | — | Selects available Omni machines by label. Supports both `matchLabels` and `matchExpressions`. Empty `matchLabels: {}` matches any available machine. |
 | `spec.controlPlane.configPatches[]` | `[]ConfigPatch` | no | — | Talos machine config patches applied to every control-plane machine. |
 | `spec.controlPlane.configPatches[].name` | `string` | yes | — | Unique identifier for this patch within the machine set. |
 | `spec.controlPlane.configPatches[].inline` | `JSON` | yes | — | Patch content in Talos machine config YAML/JSON format. |
@@ -212,7 +212,9 @@ Flux can immediately target the cluster using a `Kustomization` with
 ## Machine Label Selectors
 
 Omni automatically applies labels to registered machines under the `omni.sidero.dev/` prefix.
-Use these labels in `machineSelector.matchLabels` to target specific hardware.
+Use these labels in `machineSelector` to target specific hardware. Both `matchLabels` and
+`matchExpressions` (operators `In`, `NotIn`, `Exists`, `DoesNotExist`) are supported, with
+standard Kubernetes label-selector semantics; when both are given they are ANDed together.
 
 | Label | Example value | Description |
 |-------|--------------|-------------|
@@ -238,6 +240,21 @@ spec:
         matchLabels:
           omni.sidero.dev/platform: metal
           omni.sidero.dev/mem: "32768"
+```
+
+**Example: use `matchExpressions` to target either of two platforms while excluding GPU machines:**
+
+```yaml
+spec:
+  controlPlane:
+    replicas: 3
+    machineSelector:
+      matchExpressions:
+        - key: omni.sidero.dev/platform
+          operator: In
+          values: ["metal", "aws"]
+        - key: gpu
+          operator: DoesNotExist
 ```
 
 The controller automatically appends `omni.sidero.dev/available` to every machine query —

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1151,5 +1152,121 @@ func TestEnsureMachineSetNode_ConflictDifferentSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cluster-a-workers") {
 		t.Errorf("error should name the conflicting machine set cluster-a-workers, got: %v", err)
+	}
+}
+
+// ── SelectAvailableMachines tests ─────────────────────────────────────────────
+
+// createMachineStatus inserts a MachineStatus fixture into the in-memory state
+// with the given labels. available controls the built-in availability label.
+func createMachineStatus(ctx context.Context, t *testing.T, st state.State, id string, available bool, machineLabels map[string]string) {
+	t.Helper()
+	ms := omnires.NewMachineStatus(id)
+	if available {
+		ms.Metadata().Labels().Set(omnires.MachineStatusLabelAvailable, "")
+	}
+	for k, v := range machineLabels {
+		ms.Metadata().Labels().Set(k, v)
+	}
+	if err := st.Create(ctx, ms); err != nil {
+		t.Fatalf("create MachineStatus %s: %v", id, err)
+	}
+}
+
+// TestSelectAvailableMachines_MatchExpressions verifies that machineSelector
+// matchExpressions are honoured with standard Kubernetes label-selector
+// semantics, including the missing-key behaviour of NotIn and DoesNotExist.
+func TestSelectAvailableMachines_MatchExpressions(t *testing.T) {
+	ctx := context.Background()
+
+	// Fixture fleet:
+	//   metal-small   platform=metal size=small
+	//   metal-large   platform=metal size=large
+	//   aws-large     platform=aws   size=large
+	//   unlabelled    (no platform/size labels)
+	//   taken         platform=metal, but NOT available
+	setup := func(t *testing.T) *OmniClient {
+		st := newTestState()
+		createMachineStatus(ctx, t, st, "metal-small", true, map[string]string{"platform": "metal", "size": "small"})
+		createMachineStatus(ctx, t, st, "metal-large", true, map[string]string{"platform": "metal", "size": "large"})
+		createMachineStatus(ctx, t, st, "aws-large", true, map[string]string{"platform": "aws", "size": "large"})
+		createMachineStatus(ctx, t, st, "unlabelled", true, nil)
+		createMachineStatus(ctx, t, st, "taken", false, map[string]string{"platform": "metal", "size": "large"})
+		return newTestOmniClient(st)
+	}
+
+	cases := []struct {
+		name string
+		sel  metav1.LabelSelector
+		want []string
+	}{
+		{
+			name: "Exists selects only machines with the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpExists},
+			}},
+			want: []string{"aws-large", "metal-large", "metal-small"},
+		},
+		{
+			name: "DoesNotExist excludes machines with the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpDoesNotExist},
+			}},
+			want: []string{"unlabelled"},
+		},
+		{
+			name: "In with two values selects exactly the matching machines",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpIn, Values: []string{"metal", "aws"}},
+			}},
+			want: []string{"aws-large", "metal-large", "metal-small"},
+		},
+		{
+			name: "NotIn excludes listed values but includes machines lacking the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"aws"}},
+			}},
+			want: []string{"metal-large", "metal-small", "unlabelled"},
+		},
+		{
+			name: "matchLabels and matchExpressions AND together",
+			sel: metav1.LabelSelector{
+				MatchLabels: map[string]string{"platform": "metal"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "size", Operator: metav1.LabelSelectorOpIn, Values: []string{"large"}},
+				},
+			},
+			want: []string{"metal-large"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := setup(t)
+			got, err := c.SelectAvailableMachines(ctx, tc.sel, 10)
+			if err != nil {
+				t.Fatalf("SelectAvailableMachines: %v", err)
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("selected machines mismatch:\n  got  %v\n  want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectAvailableMachines_InvalidSelector verifies that a selector that
+// fails Kubernetes validation (In with no values) is rejected with an error.
+func TestSelectAvailableMachines_InvalidSelector(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	_, err := c.SelectAvailableMachines(ctx, metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "platform", Operator: metav1.LabelSelectorOpIn},
+		},
+	}, 10)
+	if err == nil {
+		t.Fatal("expected error for In expression without values, got nil")
 	}
 }

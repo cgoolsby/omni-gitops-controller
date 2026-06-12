@@ -24,9 +24,6 @@ type OmniClusterSpec struct {
 }
 
 // MachineSetSpec describes a set of machines within a cluster (control plane or workers).
-// The matchExpressions rejection rule below should be removed once
-// SelectAvailableMachines supports matchExpressions.
-// +kubebuilder:validation:XValidation:rule="!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions) == 0",message="machineSelector.matchExpressions is not supported yet; use matchLabels"
 type MachineSetSpec struct {
 	// Replicas is the desired number of machines in this set.
 	// +optional
@@ -34,8 +31,10 @@ type MachineSetSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas,omitempty"`
 	// MachineSelector selects available Omni machines by label.
-	// Matched against MachineStatuses.omni.sidero.dev labels
-	// (e.g. omni.sidero.dev/mem, omni.sidero.dev/cpu, omni.sidero.dev/platform).
+	// Both matchLabels and matchExpressions are supported, with standard
+	// Kubernetes label-selector semantics. Matched against
+	// MachineStatuses.omni.sidero.dev labels (e.g. omni.sidero.dev/mem,
+	// omni.sidero.dev/cpu, omni.sidero.dev/platform).
 	// The controller always adds omni.sidero.dev/available to the query.
 	MachineSelector metav1.LabelSelector `json:"machineSelector"`
 	// MachineExtensions is the list of Talos system extensions to install on each machine in the set.

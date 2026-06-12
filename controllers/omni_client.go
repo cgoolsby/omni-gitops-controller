@@ -19,6 +19,7 @@ import (
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // OmniClient wraps omni-client state for cluster lifecycle operations.
@@ -200,14 +201,32 @@ func (c *OmniClient) DeleteMachineSet(ctx context.Context, machineSetID string) 
 	return nil
 }
 
-// SelectAvailableMachines lists Omni MachineStatuses matching selector.matchLabels plus
-// the built-in available constraint, and returns up to count machine UUIDs.
+// SelectAvailableMachines lists Omni MachineStatuses matching the selector
+// (both matchLabels and matchExpressions) plus the built-in available
+// constraint, and returns up to count machine UUIDs.
 func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.LabelSelector, count int) ([]string, error) {
+	selector, err := metav1.LabelSelectorAsSelector(&sel)
+	if err != nil {
+		return nil, fmt.Errorf("invalid machine selector: %w", err)
+	}
+
 	labelOpts := []resource.LabelQueryOption{
 		resource.LabelExists(omnires.MachineStatusLabelAvailable),
 	}
 	for k, v := range sel.MatchLabels {
 		labelOpts = append(labelOpts, resource.LabelEqual(k, v))
+	}
+	for _, expr := range sel.MatchExpressions {
+		switch expr.Operator {
+		case metav1.LabelSelectorOpIn:
+			labelOpts = append(labelOpts, resource.LabelIn(expr.Key, expr.Values))
+		case metav1.LabelSelectorOpNotIn:
+			labelOpts = append(labelOpts, resource.LabelIn(expr.Key, expr.Values, resource.NotMatches))
+		case metav1.LabelSelectorOpExists:
+			labelOpts = append(labelOpts, resource.LabelExists(expr.Key))
+		case metav1.LabelSelectorOpDoesNotExist:
+			labelOpts = append(labelOpts, resource.LabelExists(expr.Key, resource.NotMatches))
+		}
 	}
 
 	list, err := safe.StateListAll[*omnires.MachineStatus](ctx, c.state,
@@ -219,7 +238,14 @@ func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.Lab
 
 	var ids []string
 	list.ForEach(func(ms *omnires.MachineStatus) {
-		if len(ids) < count {
+		if len(ids) >= count {
+			return
+		}
+		// Re-check the full selector client-side: the COSI push-down above is a
+		// narrowing optimisation, and this keeps Kubernetes label-selector
+		// semantics authoritative (e.g. a machine lacking the key matches NotIn
+		// and DoesNotExist) regardless of server-side query behaviour.
+		if selector.Matches(labels.Set(ms.Metadata().Labels().Raw())) {
 			ids = append(ids, ms.Metadata().ID())
 		}
 	})

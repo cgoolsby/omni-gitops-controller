@@ -8,10 +8,13 @@ import (
 // ── OmniCluster ───────────────────────────────────────────────────────────────
 
 // OmniClusterSpec is the desired state of a cluster managed by Omni.
+// +kubebuilder:validation:XValidation:rule="self.controlPlane.replicas >= 1",message="controlPlane.replicas must be at least 1"
 type OmniClusterSpec struct {
 	// KubernetesVersion is the target Kubernetes version (e.g. "1.31.0").
+	// +kubebuilder:validation:Pattern=`^\d+\.\d+\.\d+$`
 	KubernetesVersion string `json:"kubernetesVersion"`
 	// TalosVersion is the target Talos Linux version (e.g. "v1.13.0").
+	// +kubebuilder:validation:Pattern=`^v\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$`
 	TalosVersion string `json:"talosVersion"`
 	// ControlPlane describes the control-plane machine set.
 	ControlPlane MachineSetSpec `json:"controlPlane"`
@@ -21,10 +24,14 @@ type OmniClusterSpec struct {
 }
 
 // MachineSetSpec describes a set of machines within a cluster (control plane or workers).
+// The matchExpressions rejection rule below should be removed once
+// SelectAvailableMachines supports matchExpressions.
+// +kubebuilder:validation:XValidation:rule="!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions) == 0",message="machineSelector.matchExpressions is not supported yet; use matchLabels"
 type MachineSetSpec struct {
 	// Replicas is the desired number of machines in this set.
 	// +optional
 	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas,omitempty"`
 	// MachineSelector selects available Omni machines by label.
 	// Matched against MachineStatuses.omni.sidero.dev labels
@@ -50,6 +57,8 @@ type MachineSetSpec struct {
 type WorkerMachineSetSpec struct {
 	// Name identifies this worker set. Used as the Omni MachineSet suffix
 	// (resulting ID: <cluster>-<name>).
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	Name           string `json:"name"`
 	MachineSetSpec `json:",inline"`
 }

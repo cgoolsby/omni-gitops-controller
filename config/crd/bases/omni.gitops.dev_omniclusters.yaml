@@ -152,17 +152,25 @@ spec:
                     description: Replicas is the desired number of machines in this
                       set.
                     format: int32
+                    minimum: 0
                     type: integer
                 required:
                 - machineSelector
                 type: object
+                x-kubernetes-validations:
+                - message: machineSelector.matchExpressions is not supported yet;
+                    use matchLabels
+                  rule: '!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions)
+                    == 0'
               kubernetesVersion:
                 description: KubernetesVersion is the target Kubernetes version (e.g.
                   "1.31.0").
+                pattern: ^\d+\.\d+\.\d+$
                 type: string
               talosVersion:
                 description: TalosVersion is the target Talos Linux version (e.g.
                   "v1.13.0").
+                pattern: ^v\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$
                 type: string
               workers:
                 description: Workers describes additional worker machine sets. Empty
@@ -259,23 +267,34 @@ spec:
                       description: |-
                         Name identifies this worker set. Used as the Omni MachineSet suffix
                         (resulting ID: <cluster>-<name>).
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                       type: string
                     replicas:
                       default: 1
                       description: Replicas is the desired number of machines in this
                         set.
                       format: int32
+                      minimum: 0
                       type: integer
                   required:
                   - machineSelector
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: machineSelector.matchExpressions is not supported yet;
+                      use matchLabels
+                    rule: '!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions)
+                      == 0'
                 type: array
             required:
             - controlPlane
             - kubernetesVersion
             - talosVersion
             type: object
+            x-kubernetes-validations:
+            - message: controlPlane.replicas must be at least 1
+              rule: self.controlPlane.replicas >= 1
           status:
             description: OmniClusterStatus is the observed state of the cluster.
             properties:

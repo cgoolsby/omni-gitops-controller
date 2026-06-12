@@ -72,6 +72,11 @@ type ConfigPatch struct {
 
 // OmniClusterStatus is the observed state of the cluster.
 type OmniClusterStatus struct {
+	// ObservedGeneration is the .metadata.generation last processed by the controller.
+	// It is set on both success and failure paths: the controller observed the
+	// generation either way, and conditions carry the success/failure signal.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 	// Phase mirrors the Omni ClusterStatus phase (ScalingUp, Running, Destroying, etc.).
 	// +optional
 	Phase string `json:"phase,omitempty"`

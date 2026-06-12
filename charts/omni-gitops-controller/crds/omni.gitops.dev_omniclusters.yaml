@@ -374,6 +374,13 @@ spec:
                   reboot for each machine (keyed by machine UUID). Used to enforce a cooldown
                   so a persistently-drifting machine is not rebooted in a loop.
                 type: object
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the .metadata.generation last processed by the controller.
+                  It is set on both success and failure paths: the controller observed the
+                  generation either way, and conditions carry the success/failure signal.
+                format: int64
+                type: integer
               phase:
                 description: Phase mirrors the Omni ClusterStatus phase (ScalingUp,
                   Running, Destroying, etc.).

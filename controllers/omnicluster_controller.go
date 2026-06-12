@@ -161,6 +161,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Phase = omniStatus.Phase
 	cluster.Status.Ready = omniStatus.Ready
 	cluster.Status.AllocatedMachines = allocatedMachines
@@ -538,6 +539,7 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 // not retrigger reconcile through our own watch.
 func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.OmniCluster, statusBefore *api.OmniClusterStatus, reason string, err error) (ctrl.Result, error) {
 	msg := err.Error()
+	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Ready = false
 	cluster.Status.FailureReason = &reason
 	cluster.Status.FailureMessage = &msg

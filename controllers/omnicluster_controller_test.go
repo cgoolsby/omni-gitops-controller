@@ -1047,6 +1047,15 @@ func TestStatusNeedsUpdate(t *testing.T) {
 			t.Error("expected update when a status field changes")
 		}
 	})
+
+	t.Run("observedGeneration bump alone needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		after.ObservedGeneration = before.ObservedGeneration + 1
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when observedGeneration changes")
+		}
+	})
 }
 
 // ── secretNeedsRefresh tests ───────────────────────────────────────────────────

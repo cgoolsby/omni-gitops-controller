@@ -46,7 +46,12 @@ type MachineConfigDrift struct {
 }
 
 // GetDriftingMachines returns machines in the cluster whose running config does not match the desired
-// config (ConfigUpToDate==false), are in the RUNNING stage, are healthy, and have no config error.
+// config (ConfigUpToDate==false) and have no config error.
+//
+// Precondition: every machine in the cluster must be healthy (RUNNING stage and Ready). If any
+// machine is unhealthy — e.g. still mid-reboot from a previous drift correction — it is not safe
+// to take another machine down, so an empty list is returned and no reboot candidates are offered
+// this cycle.
 func (c *OmniClient) GetDriftingMachines(ctx context.Context, clusterName string) ([]MachineConfigDrift, error) {
 	list, err := safe.StateListAll[*omnires.ClusterMachineStatus](ctx, c.state,
 		state.WithLabelQuery(resource.LabelEqual(omnires.LabelCluster, clusterName)),
@@ -55,14 +60,22 @@ func (c *OmniClient) GetDriftingMachines(ctx context.Context, clusterName string
 		return nil, fmt.Errorf("list cluster machine statuses for %s: %w", clusterName, err)
 	}
 
+	allHealthy := true
+	list.ForEach(func(cms *omnires.ClusterMachineStatus) {
+		spec := cms.TypedSpec().Value
+		if spec.Stage != omniSpecs.ClusterMachineStatusSpec_RUNNING || !spec.Ready {
+			allHealthy = false
+		}
+	})
+	if !allHealthy {
+		return nil, nil
+	}
+
 	var drifting []MachineConfigDrift
 
 	list.ForEach(func(cms *omnires.ClusterMachineStatus) {
 		spec := cms.TypedSpec().Value
-		if !spec.ConfigUpToDate &&
-			spec.Stage == omniSpecs.ClusterMachineStatusSpec_RUNNING &&
-			spec.Ready &&
-			spec.LastConfigError == "" {
+		if !spec.ConfigUpToDate && spec.LastConfigError == "" {
 			drifting = append(drifting, MachineConfigDrift{
 				MachineID:         cms.Metadata().ID(),
 				ManagementAddress: spec.ManagementAddress,

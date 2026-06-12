@@ -11,6 +11,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
 	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
+	omniSpecs "github.com/siderolabs/omni/client/api/omni/specs"
 	omniresources "github.com/siderolabs/omni/client/pkg/omni/resources"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	corev1 "k8s.io/api/core/v1"
@@ -354,5 +355,88 @@ func TestDeleteOmniResources_DeletesKubeconfigSecrets(t *testing.T) {
 	// A second run with no Secrets present must tolerate NotFound.
 	if err := r.deleteOmniResources(ctx, cluster); err != nil {
 		t.Fatalf("deleteOmniResources with no secrets: %v", err)
+	}
+}
+
+// ── GetDriftingMachines tests ──────────────────────────────────────────────────
+
+// createClusterMachineStatus inserts a ClusterMachineStatus fixture into the
+// in-memory state, labelled with the cluster.
+func createClusterMachineStatus(ctx context.Context, t *testing.T, st state.State, clusterName, machineID string, stage omniSpecs.ClusterMachineStatusSpec_Stage, ready, configUpToDate bool) {
+	t.Helper()
+	cms := omnires.NewClusterMachineStatus(machineID)
+	cms.Metadata().Labels().Set(omnires.LabelCluster, clusterName)
+	spec := cms.TypedSpec().Value
+	spec.Stage = stage
+	spec.Ready = ready
+	spec.ConfigUpToDate = configUpToDate
+	spec.ManagementAddress = "10.0.0.1"
+	if err := st.Create(ctx, cms); err != nil {
+		t.Fatalf("create ClusterMachineStatus %s: %v", machineID, err)
+	}
+}
+
+// TestGetDriftingMachines_AllHealthyOneDrifting verifies that when every
+// machine in the cluster is RUNNING+Ready, a drifting machine is returned
+// as a reboot candidate.
+func TestGetDriftingMachines_AllHealthyOneDrifting(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-a", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, false)
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-b", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-c", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+
+	drifting, err := c.GetDriftingMachines(ctx, clusterName)
+	if err != nil {
+		t.Fatalf("GetDriftingMachines: %v", err)
+	}
+
+	if len(drifting) != 1 {
+		t.Fatalf("expected 1 drifting machine, got %d: %v", len(drifting), drifting)
+	}
+	if drifting[0].MachineID != "machine-a" {
+		t.Errorf("expected drifting machine machine-a, got %s", drifting[0].MachineID)
+	}
+}
+
+// TestGetDriftingMachines_UnhealthyMachineBlocksReboots verifies the
+// cluster-wide health gate: if any machine is not RUNNING+Ready (e.g. still
+// mid-reboot from a previous drift correction), no reboot candidates are
+// returned even when another healthy machine is drifting.
+func TestGetDriftingMachines_UnhealthyMachineBlocksReboots(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		stage omniSpecs.ClusterMachineStatusSpec_Stage
+		ready bool
+	}{
+		{name: "non-running stage", stage: omniSpecs.ClusterMachineStatusSpec_REBOOTING, ready: false},
+		{name: "running but not ready", stage: omniSpecs.ClusterMachineStatusSpec_RUNNING, ready: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestState()
+			c := newTestOmniClient(st)
+
+			clusterName := "test-cluster"
+			// machine-a is unhealthy (e.g. just rebooted by the previous cycle).
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-a", tc.stage, tc.ready, true)
+			// machine-b is healthy and drifting.
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-b", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, false)
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-c", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+
+			drifting, err := c.GetDriftingMachines(ctx, clusterName)
+			if err != nil {
+				t.Fatalf("GetDriftingMachines: %v", err)
+			}
+			if len(drifting) != 0 {
+				t.Errorf("expected no reboot candidates while a machine is unhealthy, got %v", drifting)
+			}
+		})
 	}
 }

@@ -180,7 +180,9 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setFailure(ctx, cluster, "EnsureKubeconfigFailed", kubeconfigErr)
 	}
 
-	// Reboot the first drifting machine (rolling window = 1, prevents simultaneous reboots in HA clusters).
+	// Reboot the first drifting machine (rolling window = 1). The window is enforced by
+	// GetDriftingMachines, which returns no candidates while any machine in the cluster is
+	// unhealthy — so a machine still rebooting from the previous cycle blocks further reboots.
 	if len(drifting) > 0 {
 		first := drifting[0]
 		logger.Info("Config drift detected, triggering reboot", "machine", first.MachineID, "addr", first.ManagementAddress)

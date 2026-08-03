@@ -1,5 +1,6 @@
 # Build output
 /omni-gitops-controller
+bin/
 *.test
 
 # IDE

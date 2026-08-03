@@ -86,6 +86,7 @@ func main() {
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		OmniClient:          omniClient,
+		Recorder:            mgr.GetEventRecorder("omni-gitops-controller"),
 		KubeconfigNamespace: kubeconfigNamespace,
 		ArgoCDClusters:      argoCDClusters,
 	}).SetupWithManager(mgr); err != nil {

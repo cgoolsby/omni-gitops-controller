@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -17,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -46,8 +48,19 @@ type OmniClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	OmniClient          *OmniClient
+	Recorder            events.EventRecorder
 	KubeconfigNamespace string
 	ArgoCDClusters      bool
+}
+
+// eventf records an event on the cluster. Recorder may be nil (unit tests
+// construct the reconciler without a manager), in which case this is a no-op.
+func (r *OmniClusterReconciler) eventf(cluster *api.OmniCluster, eventType, reason, format string, args ...any) {
+	if r.Recorder != nil {
+		// The new events API adds a related object and an action; we have no
+		// secondary object, and the reason doubles as the action.
+		r.Recorder.Eventf(cluster, nil, eventType, reason, reason, format, args...)
+	}
 }
 
 // +kubebuilder:rbac:groups=omni.gitops.dev,resources=omniclusters,verbs=get;list;watch;create;update;patch;delete
@@ -77,6 +90,7 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			if err := r.deleteOmniResources(ctx, cluster); err != nil {
 				return ctrl.Result{}, fmt.Errorf("delete omni resources: %w", err)
 			}
+			deleteClusterMetrics(cluster.Name, cluster.Namespace)
 			controllerutil.RemoveFinalizer(cluster, finalizerName)
 			if err := r.Update(ctx, cluster); err != nil {
 				return ctrl.Result{}, err
@@ -139,10 +153,29 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
+	// Prune machine sets that exist in Omni but are no longer declared in spec.
+	// allocatedMachines is built only from spec-declared sets above, so pruned
+	// sets never appear in the status update below.
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		return r.setFailure(ctx, cluster, statusBefore, "PruneOrphanedMachineSetFailed", err)
+	}
+
 	// ── Update status from Omni ───────────────────────────────────────────────
 	omniStatus, err := r.OmniClient.GetClusterStatus(ctx, clusterName)
 	if err != nil {
 		return r.setFailure(ctx, cluster, statusBefore, "GetStatusFailed", err)
+	}
+
+	clusterReadyGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(omniStatus.Ready))
+
+	// Reset the per-machineset series before re-setting them so machine sets
+	// removed from spec do not linger as stale series.
+	clusterMachinesAllocatedGauge.DeletePartialMatch(prometheus.Labels{
+		"name":      cluster.Name,
+		"namespace": cluster.Namespace,
+	})
+	for machineSetID, machines := range allocatedMachines {
+		clusterMachinesAllocatedGauge.WithLabelValues(cluster.Name, cluster.Namespace, machineSetID).Set(float64(len(machines)))
 	}
 
 	// Detect config drift only when the cluster is ready (machines must be Running).
@@ -153,7 +186,9 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return r.setFailure(ctx, cluster, statusBefore, "ConfigDriftCheckFailed", err)
 		}
 	}
+	clusterConfigDriftGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(len(drifting) > 0))
 
+	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Phase = omniStatus.Phase
 	cluster.Status.Ready = omniStatus.Ready
 	cluster.Status.AllocatedMachines = allocatedMachines
@@ -216,6 +251,8 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
 			ObservedGeneration: cluster.Generation,
 		})
+		r.eventf(cluster, corev1.EventTypeWarning, "RebootCooldown",
+			"Machine(s) %s still drifting after a recent reboot; waiting for the %s cooldown", strings.Join(waiting, ", "), rebootCooldown)
 	}
 
 	if statusNeedsUpdate(statusBefore, &cluster.Status) {
@@ -229,14 +266,24 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
 
-	var kubeconfigErr error
+	var (
+		kubeconfigName    string
+		kubeconfigWritten bool
+		kubeconfigErr     error
+	)
 	if r.ArgoCDClusters {
-		kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
+		kubeconfigName = clusterName + "-cluster-secret"
+		kubeconfigWritten, kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
 	} else {
-		kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
+		kubeconfigName = clusterName + "-kubeconfig"
+		kubeconfigWritten, kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
 	}
 	if kubeconfigErr != nil {
 		return r.setFailure(ctx, cluster, statusBefore, "EnsureKubeconfigFailed", kubeconfigErr)
+	}
+	if kubeconfigWritten {
+		r.eventf(cluster, corev1.EventTypeNormal, "KubeconfigWritten",
+			"Kubeconfig written to %s/%s", r.KubeconfigNamespace, kubeconfigName)
 	}
 
 	// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
@@ -247,6 +294,11 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("Config drift detected, triggering reboot", "machine", rebootCandidate.MachineID, "addr", rebootCandidate.ManagementAddress)
 		if err := r.OmniClient.RebootMachine(ctx, clusterName, rebootCandidate.ManagementAddress); err != nil {
 			logger.Error(err, "Failed to reboot machine", "machine", rebootCandidate.MachineID)
+			r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
+		} else {
+			machineRebootsTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
+			r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
+				"Rebooting machine %s to apply config update", rebootCandidate.MachineID)
 		}
 		return ctrl.Result{RequeueAfter: requeueLong}, nil
 	}
@@ -305,6 +357,8 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 			}
 			already = append(already, machineID)
 		}
+		r.eventf(cluster, corev1.EventTypeNormal, "MachinesAllocated",
+			"Allocated %d machine(s) to %s", len(fresh), machineSetID)
 
 	} else if needed < 0 {
 		// ── Scale down ────────────────────────────────────────────────────────
@@ -333,14 +387,8 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		keep := already[:len(already)-toRemove]
 
 		for _, machineID := range evict {
-			if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
-				return nil, fmt.Errorf("remove machine %s from %s: %w", machineID, machineSetID, err)
-			}
-			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
-				return nil, fmt.Errorf("cleanup patches for evicted machine %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-				return nil, fmt.Errorf("cleanup kernel args for evicted machine %s: %w", machineID, err)
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return nil, fmt.Errorf("evict machine %s from %s: %w", machineID, machineSetID, err)
 			}
 		}
 		already = keep
@@ -380,6 +428,70 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 	}
 
 	return already, nil
+}
+
+// releaseMachine unbinds a machine from its machine set and removes its
+// ConfigPatches and KernelArgs, so the machine returns to the available pool
+// without carrying stale customisation into the next cluster that allocates
+// it. DeleteMachineSetNode returns an error while Omni teardown is in
+// progress, which makes the caller requeue and retry.
+func (r *OmniClusterReconciler) releaseMachine(ctx context.Context, clusterName, machineID string) error {
+	if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
+		return fmt.Errorf("delete machine set node %s: %w", machineID, err)
+	}
+	if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
+		return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
+	}
+	if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
+		return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+	}
+	return nil
+}
+
+// pruneOrphanedMachineSets deletes Omni MachineSets labelled with this cluster
+// that are no longer declared in spec — e.g. when a user removes a worker set
+// from spec.workers without deleting the whole OmniCluster. Like
+// deleteOmniResources, discovery is driven by Omni state (the authoritative
+// source) rather than status.AllocatedMachines, which can be empty or stale.
+func (r *OmniClusterReconciler) pruneOrphanedMachineSets(ctx context.Context, cluster *api.OmniCluster, clusterName string) error {
+	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
+	desired := map[string]bool{cpMachineSetID: true}
+	for _, w := range cluster.Spec.Workers {
+		desired[fmt.Sprintf("%s-%s", clusterName, w.Name)] = true
+	}
+
+	actual, err := r.OmniClient.ListMachineSetIDsForCluster(ctx, clusterName)
+	if err != nil {
+		return fmt.Errorf("list machine sets for cluster %s: %w", clusterName, err)
+	}
+
+	for _, machineSetID := range actual {
+		if desired[machineSetID] {
+			continue
+		}
+		// The control-plane set is always in desired; guard anyway so a bug in
+		// desired-set construction can never tear down the control plane.
+		if machineSetID == cpMachineSetID {
+			continue
+		}
+
+		machines, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+		if err != nil {
+			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
+		}
+		for _, machineID := range machines {
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return fmt.Errorf("release machine from orphaned set %s: %w", machineSetID, err)
+			}
+		}
+		if err := r.OmniClient.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+			return fmt.Errorf("delete extensions configuration for orphaned machine set %s: %w", machineSetID, err)
+		}
+		if err := r.OmniClient.DeleteMachineSet(ctx, machineSetID); err != nil {
+			return fmt.Errorf("delete orphaned machine set %s: %w", machineSetID, err)
+		}
+	}
+	return nil
 }
 
 // applyConfigPatches creates or updates Omni ConfigPatches for a machine,
@@ -450,14 +562,8 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
 		}
 		for _, machineID := range machines {
-			if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
-				return fmt.Errorf("delete machine set node %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
-				return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
-			}
-			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-				return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+				return err
 			}
 		}
 	}
@@ -471,7 +577,11 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 		}
 	}
 
-	return r.OmniClient.DeleteCluster(ctx, clusterName)
+	if err := r.OmniClient.DeleteCluster(ctx, clusterName); err != nil {
+		return err
+	}
+	r.eventf(cluster, corev1.EventTypeNormal, "ClusterDeleted", "Omni cluster resources deleted")
+	return nil
 }
 
 // setFailure updates status with a failure reason and requeues. The write is
@@ -479,6 +589,8 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 // not retrigger reconcile through our own watch.
 func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.OmniCluster, statusBefore *api.OmniClusterStatus, reason string, err error) (ctrl.Result, error) {
 	msg := err.Error()
+	r.eventf(cluster, corev1.EventTypeWarning, reason, "%s", msg)
+	cluster.Status.ObservedGeneration = cluster.Generation
 	cluster.Status.Ready = false
 	cluster.Status.FailureReason = &reason
 	cluster.Status.FailureMessage = &msg
@@ -515,23 +627,24 @@ func secretNeedsRefresh(secret *corev1.Secret, dataKey string, now time.Time) bo
 // ensureKubeconfigSecret fetches the cluster kubeconfig from Omni and writes it
 // as a Secret for Flux remote cluster apply. The fetch is skipped while the
 // existing Secret is younger than kubeconfigRefreshInterval, so a new
-// service-account token is not minted on every reconcile.
-func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clusterName string) error {
+// service-account token is not minted on every reconcile. The returned bool
+// reports whether the Secret was actually written (false on the skip path).
+func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clusterName string) (bool, error) {
 	now := time.Now()
 	secretName := clusterName + "-kubeconfig"
 
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
 	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("get kubeconfig secret %s: %w", secretName, err)
+		return false, fmt.Errorf("get kubeconfig secret %s: %w", secretName, err)
 	}
 	if err == nil && !secretNeedsRefresh(existing, "value", now) {
-		return nil
+		return false, nil
 	}
 
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -547,47 +660,48 @@ func (r *OmniClusterReconciler) ensureKubeconfigSecret(ctx context.Context, clus
 		secret.Data = map[string][]byte{"value": data}
 		return nil
 	})
-	return err
+	return err == nil, err
 }
 
 // ensureArgoCDClusterSecret writes the cluster kubeconfig as an ArgoCD cluster Secret.
 // The fetch is skipped while the existing Secret is younger than
 // kubeconfigRefreshInterval, so a new service-account token is not minted on
-// every reconcile.
-func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, clusterName string) error {
+// every reconcile. The returned bool reports whether the Secret was actually
+// written (false on the skip path).
+func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, clusterName string) (bool, error) {
 	now := time.Now()
 	secretName := clusterName + "-cluster-secret"
 
 	existing := &corev1.Secret{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: r.KubeconfigNamespace, Name: secretName}, existing)
 	if err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("get argocd cluster secret %s: %w", secretName, err)
+		return false, fmt.Errorf("get argocd cluster secret %s: %w", secretName, err)
 	}
 	if err == nil && !secretNeedsRefresh(existing, "config", now) {
-		return nil
+		return false, nil
 	}
 
 	data, err := r.OmniClient.GetKubeconfig(ctx, clusterName)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	cfg, err := clientcmd.Load(data)
 	if err != nil {
-		return fmt.Errorf("parse kubeconfig: %w", err)
+		return false, fmt.Errorf("parse kubeconfig: %w", err)
 	}
 
 	kctx, ok := cfg.Contexts[cfg.CurrentContext]
 	if !ok {
-		return fmt.Errorf("context %q not found in kubeconfig", cfg.CurrentContext)
+		return false, fmt.Errorf("context %q not found in kubeconfig", cfg.CurrentContext)
 	}
 	clusterEntry, ok := cfg.Clusters[kctx.Cluster]
 	if !ok {
-		return fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
+		return false, fmt.Errorf("cluster %q not found in kubeconfig", kctx.Cluster)
 	}
 	authInfo, ok := cfg.AuthInfos[kctx.AuthInfo]
 	if !ok {
-		return fmt.Errorf("user %q not found in kubeconfig", kctx.AuthInfo)
+		return false, fmt.Errorf("user %q not found in kubeconfig", kctx.AuthInfo)
 	}
 
 	type tlsClientConfig struct {
@@ -607,7 +721,7 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal argocd config: %w", err)
+		return false, fmt.Errorf("marshal argocd config: %w", err)
 	}
 
 	secret := &corev1.Secret{
@@ -632,7 +746,7 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 		}
 		return nil
 	})
-	return err
+	return err == nil, err
 }
 
 func (r *OmniClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {

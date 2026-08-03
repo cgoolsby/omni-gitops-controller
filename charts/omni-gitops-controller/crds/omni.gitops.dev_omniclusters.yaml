@@ -100,8 +100,10 @@ spec:
                   machineSelector:
                     description: |-
                       MachineSelector selects available Omni machines by label.
-                      Matched against MachineStatuses.omni.sidero.dev labels
-                      (e.g. omni.sidero.dev/mem, omni.sidero.dev/cpu, omni.sidero.dev/platform).
+                      Both matchLabels and matchExpressions are supported, with standard
+                      Kubernetes label-selector semantics. Matched against
+                      MachineStatuses.omni.sidero.dev labels (e.g. omni.sidero.dev/mem,
+                      omni.sidero.dev/cpu, omni.sidero.dev/platform).
                       The controller always adds omni.sidero.dev/available to the query.
                     properties:
                       matchExpressions:
@@ -157,11 +159,6 @@ spec:
                 required:
                 - machineSelector
                 type: object
-                x-kubernetes-validations:
-                - message: machineSelector.matchExpressions is not supported yet;
-                    use matchLabels
-                  rule: '!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions)
-                    == 0'
               kubernetesVersion:
                 description: KubernetesVersion is the target Kubernetes version (e.g.
                   "1.31.0").
@@ -216,8 +213,10 @@ spec:
                     machineSelector:
                       description: |-
                         MachineSelector selects available Omni machines by label.
-                        Matched against MachineStatuses.omni.sidero.dev labels
-                        (e.g. omni.sidero.dev/mem, omni.sidero.dev/cpu, omni.sidero.dev/platform).
+                        Both matchLabels and matchExpressions are supported, with standard
+                        Kubernetes label-selector semantics. Matched against
+                        MachineStatuses.omni.sidero.dev labels (e.g. omni.sidero.dev/mem,
+                        omni.sidero.dev/cpu, omni.sidero.dev/platform).
                         The controller always adds omni.sidero.dev/available to the query.
                       properties:
                         matchExpressions:
@@ -281,11 +280,6 @@ spec:
                   - machineSelector
                   - name
                   type: object
-                  x-kubernetes-validations:
-                  - message: machineSelector.matchExpressions is not supported yet;
-                      use matchLabels
-                    rule: '!has(self.machineSelector.matchExpressions) || size(self.machineSelector.matchExpressions)
-                      == 0'
                 type: array
             required:
             - controlPlane
@@ -380,6 +374,13 @@ spec:
                   reboot for each machine (keyed by machine UUID). Used to enforce a cooldown
                   so a persistently-drifting machine is not rebooted in a loop.
                 type: object
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the .metadata.generation last processed by the controller.
+                  It is set on both success and failure paths: the controller observed the
+                  generation either way, and conditions carry the success/failure signal.
+                format: int64
+                type: integer
               phase:
                 description: Phase mirrors the Omni ClusterStatus phase (ScalingUp,
                   Running, Destroying, etc.).

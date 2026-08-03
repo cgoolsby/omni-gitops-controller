@@ -1,0 +1,17 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "omni-gitops-controller.name" . }}-metrics
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ include "omni-gitops-controller.name" . }}
+spec:
+  selector:
+    app: {{ include "omni-gitops-controller.name" . }}
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+{{- end }}

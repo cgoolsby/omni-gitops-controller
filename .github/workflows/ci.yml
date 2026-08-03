@@ -24,6 +24,20 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test -v -race ./...
+
   crd-drift:
     name: CRD Drift Check
     runs-on: ubuntu-latest
@@ -35,19 +49,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install controller-gen
-        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
-
       - name: Regenerate CRDs
-        run: |
-          controller-gen crd:generateEmbeddedObjectMeta=true \
-            paths="./api/..." \
-            output:crd:artifacts:config=config/crd/bases
+        run: make manifests
 
       - name: Check for drift
         run: |
-          if ! git diff --exit-code config/crd/bases/; then
-            echo "CRD YAML is out of sync with Go types. Run controller-gen and commit the result."
+          if ! git diff --exit-code config/crd/bases/ charts/omni-gitops-controller/crds/; then
+            echo "CRD YAML is out of sync with Go types. Run 'make manifests' and commit the result."
             exit 1
           fi
 
@@ -62,8 +70,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-
       - name: Run golangci-lint
-        run: golangci-lint run --timeout=5m
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+          args: --timeout=5m

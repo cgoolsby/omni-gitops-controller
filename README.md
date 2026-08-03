@@ -144,6 +144,24 @@ kubectl create secret generic omni-credentials \
 kubectl apply -k https://github.com/cgoolsby/omni-gitops-controller/config/default
 ```
 
+**Verifying the image (optional):**
+
+Release images are signed with [cosign](https://github.com/sigstore/cosign)
+keyless signing via GitHub OIDC, and ship with an attached CycloneDX SBOM.
+To verify a release image:
+
+```bash
+cosign verify ghcr.io/cgoolsby/omni-gitops-controller:<version> \
+  --certificate-identity-regexp='^https://github.com/cgoolsby/omni-gitops-controller/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+```
+
+To download the SBOM:
+
+```bash
+cosign download sbom ghcr.io/cgoolsby/omni-gitops-controller:<version> > sbom.cyclonedx.json
+```
+
 ### 3. Declare your first cluster
 
 ```yaml
@@ -186,33 +204,42 @@ Flux can immediately target the cluster using a `Kustomization` with
 | `spec.talosVersion` | `string` | yes | — | Target Talos Linux version, e.g. `"v1.9.0"`. Must include the `v` prefix. |
 | `spec.controlPlane` | `MachineSetSpec` | yes | — | Describes the control-plane machine set. |
 | `spec.controlPlane.replicas` | `int32` | no | `1` | Number of control-plane machines. Use `1` or an odd number ≥ 3 for etcd quorum. |
-| `spec.controlPlane.machineSelector` | `LabelSelector` | yes | — | Selects available Omni machines by label. Empty `matchLabels: {}` matches any available machine. |
+| `spec.controlPlane.machineSelector` | `LabelSelector` | yes | — | Selects available Omni machines by label. Supports both `matchLabels` and `matchExpressions`. Empty `matchLabels: {}` matches any available machine. |
 | `spec.controlPlane.configPatches[]` | `[]ConfigPatch` | no | — | Talos machine config patches applied to every control-plane machine. |
 | `spec.controlPlane.configPatches[].name` | `string` | yes | — | Unique identifier for this patch within the machine set. |
 | `spec.controlPlane.configPatches[].inline` | `JSON` | yes | — | Patch content in Talos machine config YAML/JSON format. |
+| `spec.controlPlane.machineExtensions[]` | `[]string` | no | — | Talos system extension IDs (e.g. `siderolabs/nvidia-open-gpu-kernel-modules`). Creates/updates an `ExtensionsConfiguration` scoped to the machine set; clearing the list deletes it so the schematic reverts. |
+| `spec.controlPlane.kernelArgs[]` | `[]string` | no | — | Extra kernel args applied at the **schematic** level (active during maintenance/install boot, e.g. `libata.force=noncq`). Clearing the list removes the per-machine `KernelArgs` resource; evicted machines also release theirs. |
 | `spec.workers[]` | `[]WorkerMachineSetSpec` | no | — | Additional worker machine sets. Omit for single-node clusters. |
 | `spec.workers[].name` | `string` | yes | — | Identifies the worker set. Becomes the Omni MachineSet suffix: `<cluster>-<name>`. |
 | `spec.workers[].replicas` | `int32` | no | `1` | Number of worker machines in this set. |
 | `spec.workers[].machineSelector` | `LabelSelector` | yes | — | Selects available machines for this worker set. |
 | `spec.workers[].configPatches[]` | `[]ConfigPatch` | no | — | Config patches applied to every machine in this worker set. |
+| `spec.workers[].machineExtensions[]` | `[]string` | no | — | Talos system extension IDs for this worker set. Same semantics as `spec.controlPlane.machineExtensions[]`. |
+| `spec.workers[].kernelArgs[]` | `[]string` | no | — | Extra schematic-level kernel args for this worker set. Same semantics as `spec.controlPlane.kernelArgs[]`. |
 
 ### Status Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `status.observedGeneration` | `int64` | The `.metadata.generation` last processed by the controller. Set on both success and failure paths; conditions carry the success/failure signal. |
 | `status.phase` | `string` | Mirrors the Omni ClusterStatus phase: `ScalingUp`, `Running`, `ScalingDown`, `Destroying`, `Failed`. |
 | `status.ready` | `bool` | `true` when Omni reports the cluster as `Running` and the Kubernetes API is reachable. |
 | `status.allocatedMachines` | `map[string][]string` | Machine UUIDs bound to this cluster, keyed by MachineSet ID. Used to detect drift on re-reconcile. |
+| `status.lastRebootTimes` | `map[string]Time` | When the controller last issued a drift-remediation reboot for each machine, keyed by machine UUID. Enforces the reboot cooldown (see [Config Drift Detection](#config-drift-detection)). |
 | `status.failureReason` | `string` | Short machine-readable token when `phase` is `Failed`, e.g. `EnsureClusterFailed`. |
 | `status.failureMessage` | `string` | Human-readable error description when `phase` is `Failed`. |
-| `status.conditions[]` | `[]metav1.Condition` | Standard Kubernetes condition set. Condition types include `Ready`, `ClusterProvisioned`, `MachinesAllocated`, `KubeconfigWritten`. |
+| `status.conditions[Ready]` | `metav1.Condition` | `True` when Omni reports the cluster `Running` and the Kubernetes API is reachable. The reason mirrors the Omni phase (e.g. `Running`, `ScalingUp`), or is a failure reason (e.g. `EnsureClusterFailed`) when reconcile fails. |
+| `status.conditions[ConfigDriftDetected]` | `metav1.Condition` | `True` with reason `PendingReboot` or `RebootCooldown` when machines are drifting; `False` with reason `AllMachinesUpToDate` when all machines run the target config. See [Config Drift Detection](#config-drift-detection). |
 
 ---
 
 ## Machine Label Selectors
 
 Omni automatically applies labels to registered machines under the `omni.sidero.dev/` prefix.
-Use these labels in `machineSelector.matchLabels` to target specific hardware.
+Use these labels in `machineSelector` to target specific hardware. Both `matchLabels` and
+`matchExpressions` (operators `In`, `NotIn`, `Exists`, `DoesNotExist`) are supported, with
+standard Kubernetes label-selector semantics; when both are given they are ANDed together.
 
 | Label | Example value | Description |
 |-------|--------------|-------------|
@@ -238,6 +265,21 @@ spec:
         matchLabels:
           omni.sidero.dev/platform: metal
           omni.sidero.dev/mem: "32768"
+```
+
+**Example: use `matchExpressions` to target either of two platforms while excluding GPU machines:**
+
+```yaml
+spec:
+  controlPlane:
+    replicas: 3
+    machineSelector:
+      matchExpressions:
+        - key: omni.sidero.dev/platform
+          operator: In
+          values: ["metal", "aws"]
+        - key: gpu
+          operator: DoesNotExist
 ```
 
 The controller automatically appends `omni.sidero.dev/available` to every machine query —
@@ -353,6 +395,69 @@ See [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) for a complet
 
 ---
 
+## Config Drift Detection
+
+Config changes declared in Git propagate to running machines automatically. When you change
+`configPatches` (or other config-level spec fields) on an `OmniCluster`, the controller pushes
+the new desired config to Omni, and each machine's running config falls behind — Omni reports
+`ConfigUpToDate: false` for that machine. Applying the new config to a Talos machine requires a
+reboot, which the controller performs one machine at a time.
+
+**Detection.** On every reconcile of a Ready cluster, the controller lists Omni's
+`ClusterMachineStatus` resources for the cluster and collects machines whose config is out of
+date (and that have no config error — a machine with a `LastConfigError` is never rebooted,
+since rebooting won't fix a bad config).
+
+**Cluster-wide health gate.** Reboots are only considered when **every** machine in the cluster
+is in the `RUNNING` stage and Ready. If any machine is unhealthy — including one still coming
+back from a previous drift-correction reboot — no reboot candidates are offered that cycle.
+This is what enforces "at most one machine down at a time": the next reboot is not issued until
+the previous machine has fully rejoined. In an HA control plane this preserves etcd quorum.
+
+**Reboot cooldown.** Each machine's last reboot attempt is recorded in
+`status.lastRebootTimes` (keyed by machine ID, written before the reboot RPC so a failed RPC
+doesn't cause hammering). A machine is not rebooted again within **10 minutes** of its last
+attempt. If a machine is still drifting inside that window — for example, the config genuinely
+requires more than a reboot — the controller surfaces it via the `RebootCooldown` condition and
+a Warning event instead of reboot-looping it.
+
+**Conditions.** Drift state is reported on the `ConfigDriftDetected` condition:
+
+| Status | Reason | Meaning |
+|--------|--------|---------|
+| `True` | `PendingReboot` | A drifting machine was found and a reboot is being issued. |
+| `True` | `RebootCooldown` | Drifting machine(s) were rebooted recently and are waiting out the cooldown. |
+| `False` | `AllMachinesUpToDate` | All machines are running the target config. |
+
+**Observing:**
+
+```bash
+kubectl describe omnicluster my-cluster -n omni-gitops-system
+
+kubectl get omnicluster my-cluster -n omni-gitops-system \
+  -o jsonpath='{.status.conditions}'
+
+# Last drift-remediation reboot attempt per machine
+kubectl get omnicluster my-cluster -n omni-gitops-system \
+  -o jsonpath='{.status.lastRebootTimes}'
+```
+
+Reboots also emit `RebootTriggered` / `RebootFailed` / `RebootCooldown` events on the
+`OmniCluster`.
+
+**Limitations:**
+
+- There is no opt-out flag yet — when drift is detected and the health gate passes, the reboot
+  is always automatic. If you need a manual maintenance window, don't push the config change
+  until you're ready for the rolling reboot.
+- Schematic-level changes (`machineExtensions`, `kernelArgs`) are written as Omni
+  `ExtensionsConfiguration` / `KernelArgs` resources, and Omni applies them through its own
+  upgrade flow. The drift-reboot path does not special-case them: if a schematic change leaves
+  a machine drifting in a way a plain reboot cannot resolve, the machine will surface under
+  `RebootCooldown` until Omni's upgrade completes.
+
+---
+
 ## Examples
 
 | File | Description |
@@ -360,6 +465,7 @@ See [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) for a complet
 | [`examples/single-node.yaml`](examples/single-node.yaml) | Single control-plane node, no workers. |
 | [`examples/ha-control-plane.yaml`](examples/ha-control-plane.yaml) | Three-node HA control plane + worker pool, selected by RAM label. |
 | [`examples/with-config-patches.yaml`](examples/with-config-patches.yaml) | Config patches for KubePrism, sysctl tuning, and GPU kernel modules. |
+| [`examples/with-extensions-and-kernel-args.yaml`](examples/with-extensions-and-kernel-args.yaml) | GPU worker pool with NVIDIA system extensions, schematic-level kernel args, and a config patch loading the nvidia modules. |
 | [`examples/flux-kustomization.yaml`](examples/flux-kustomization.yaml) | Flux `Kustomization` resources targeting a provisioned cluster. |
 | [`examples/argocd-cluster.yaml`](examples/argocd-cluster.yaml) | `OmniCluster` for use with `--argocd-clusters`. |
 
@@ -414,6 +520,10 @@ This will leave Omni resources orphaned — clean them up manually in the Omni U
 2. Build and verify: `go build ./...` and `go vet ./...` (requires Go 1.22+).
 3. Make your changes. Keep diffs surgical — touch only what the change requires.
 4. Open a pull request against `main` on [GitHub Issues](https://github.com/cgoolsby/omni-gitops-controller/issues).
+
+Note: the Helm chart's `version` and `appVersion` are kept identical and are
+bumped together to the tag version by the release workflow — don't bump them
+manually in PRs.
 
 ---
 

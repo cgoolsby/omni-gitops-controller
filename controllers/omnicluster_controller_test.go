@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -571,6 +573,133 @@ func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
 	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined), "Cluster "+clusterName)
 }
 
+// ── pruneOrphanedMachineSets tests ────────────────────────────────────────────
+
+// setupMachineSetWithResources creates a MachineSet with one bound machine plus
+// the full per-machine/per-set resource complement: a ConfigPatch and
+// KernelArgs for the machine, and an ExtensionsConfiguration for the set.
+func setupMachineSetWithResources(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID, role string) {
+	t.Helper()
+	if err := c.EnsureMachineSet(ctx, clusterName, machineSetID, role); err != nil {
+		t.Fatalf("ensure machine set %s: %v", machineSetID, err)
+	}
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, role)
+	patchID := fmt.Sprintf("%s-%s-%s", clusterName, machineID, "install-disk")
+	inline := json.RawMessage(mustJSON(map[string]any{"machine": map[string]any{"install": map[string]any{"disk": "/dev/sda"}}}))
+	if err := c.EnsureConfigPatch(ctx, patchID, clusterName, machineSetID, machineID, inline); err != nil {
+		t.Fatalf("ensure config patch %s: %v", patchID, err)
+	}
+	if err := c.EnsureMachineKernelArgs(ctx, machineID, []string{"libata.force=noncq"}); err != nil {
+		t.Fatalf("ensure kernel args %s: %v", machineID, err)
+	}
+	if err := c.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, machineSetID, []string{"siderolabs/iscsi-tools"}); err != nil {
+		t.Fatalf("ensure extensions configuration %s: %v", machineSetID, err)
+	}
+}
+
+// TestPruneOrphanedMachineSets_ReleasesRemovedWorkerSet verifies that a worker
+// machine set removed from spec.workers is torn down in Omni — its
+// MachineSetNodes, ConfigPatches, KernelArgs, ExtensionsConfiguration, and the
+// MachineSet itself — while a still-declared set and the control-plane set are
+// left untouched.
+func TestPruneOrphanedMachineSets_ReleasesRemovedWorkerSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := omnires.ControlPlanesResourceID(clusterName)
+	keepSetID := clusterName + "-workers-keep"
+	orphanSetID := clusterName + "-workers-orphan"
+
+	setupMachineSetWithResources(t, ctx, c, clusterName, cpSetID, "cp-uuid-1", omnires.LabelControlPlaneRole)
+	setupMachineSetWithResources(t, ctx, c, clusterName, keepSetID, "worker-uuid-keep", omnires.LabelWorkerRole)
+	setupMachineSetWithResources(t, ctx, c, clusterName, orphanSetID, "worker-uuid-orphan", omnires.LabelWorkerRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+
+	// Spec declares only the "workers-keep" set; "workers-orphan" was removed.
+	cluster := &api.OmniCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName},
+		Spec: api.OmniClusterSpec{
+			Workers: []api.WorkerMachineSetSpec{
+				{Name: "workers-keep", MachineSetSpec: api.MachineSetSpec{Replicas: 1}},
+			},
+		},
+	}
+
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		t.Fatalf("pruneOrphanedMachineSets: %v", err)
+	}
+
+	assertGone := func(md resource.Metadata, desc string) {
+		t.Helper()
+		_, err := st.Get(ctx, md)
+		if err == nil {
+			t.Errorf("%s should have been pruned but still exists", desc)
+		} else if !state.IsNotFoundError(err) {
+			t.Fatalf("unexpected error checking %s: %v", desc, err)
+		}
+	}
+	assertPresent := func(md resource.Metadata, desc string) {
+		t.Helper()
+		if _, err := st.Get(ctx, md); err != nil {
+			t.Errorf("%s should have survived pruning: %v", desc, err)
+		}
+	}
+
+	// The orphaned set and all its resources are gone.
+	orphanPatchID := fmt.Sprintf("%s-%s-%s", clusterName, "worker-uuid-orphan", "install-disk")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, "worker-uuid-orphan", resource.VersionUndefined), "MachineSetNode worker-uuid-orphan")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, orphanPatchID, resource.VersionUndefined), "ConfigPatch "+orphanPatchID)
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, "worker-uuid-orphan", resource.VersionUndefined), "KernelArgs worker-uuid-orphan")
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+orphanSetID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+orphanSetID)
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, orphanSetID, resource.VersionUndefined), "MachineSet "+orphanSetID)
+
+	// The surviving worker set and the control-plane set are untouched.
+	for _, s := range []struct{ setID, machineID string }{
+		{keepSetID, "worker-uuid-keep"},
+		{cpSetID, "cp-uuid-1"},
+	} {
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, s.machineID, resource.VersionUndefined), "MachineSetNode "+s.machineID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, patchID, resource.VersionUndefined), "ConfigPatch "+patchID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, s.machineID, resource.VersionUndefined), "KernelArgs "+s.machineID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+s.setID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+s.setID)
+		assertPresent(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, s.setID, resource.VersionUndefined), "MachineSet "+s.setID)
+	}
+}
+
+// TestPruneOrphanedMachineSets_NeverPrunesControlPlane verifies that the
+// control-plane machine set is never selected for pruning, even when the spec
+// declares no workers at all.
+func TestPruneOrphanedMachineSets_NeverPrunesControlPlane(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := omnires.ControlPlanesResourceID(clusterName)
+
+	setupMachineSetWithResources(t, ctx, c, clusterName, cpSetID, "cp-uuid-1", omnires.LabelControlPlaneRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+
+	if err := r.pruneOrphanedMachineSets(ctx, cluster, clusterName); err != nil {
+		t.Fatalf("pruneOrphanedMachineSets: %v", err)
+	}
+
+	msMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, cpSetID, resource.VersionUndefined)
+	if _, err := st.Get(ctx, msMD); err != nil {
+		t.Errorf("control-plane MachineSet should never be pruned: %v", err)
+	}
+	nodeMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, "cp-uuid-1", resource.VersionUndefined)
+	if _, err := st.Get(ctx, nodeMD); err != nil {
+		t.Errorf("control-plane MachineSetNode should never be pruned: %v", err)
+	}
+}
+
 // ── EnsureCluster ownership tests ─────────────────────────────────────────────
 
 // TestEnsureCluster_SameOwnerUpdates verifies that the CR that created an Omni
@@ -919,6 +1048,15 @@ func TestStatusNeedsUpdate(t *testing.T) {
 			t.Error("expected update when a status field changes")
 		}
 	})
+
+	t.Run("observedGeneration bump alone needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		after.ObservedGeneration = before.ObservedGeneration + 1
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when observedGeneration changes")
+		}
+	})
 }
 
 // ── secretNeedsRefresh tests ───────────────────────────────────────────────────
@@ -1024,5 +1162,154 @@ func TestEnsureMachineSetNode_ConflictDifferentSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cluster-a-workers") {
 		t.Errorf("error should name the conflicting machine set cluster-a-workers, got: %v", err)
+	}
+}
+
+// ── SelectAvailableMachines tests ─────────────────────────────────────────────
+
+// createMachineStatus inserts a MachineStatus fixture into the in-memory state
+// with the given labels. available controls the built-in availability label.
+func createMachineStatus(ctx context.Context, t *testing.T, st state.State, id string, available bool, machineLabels map[string]string) {
+	t.Helper()
+	ms := omnires.NewMachineStatus(id)
+	if available {
+		ms.Metadata().Labels().Set(omnires.MachineStatusLabelAvailable, "")
+	}
+	for k, v := range machineLabels {
+		ms.Metadata().Labels().Set(k, v)
+	}
+	if err := st.Create(ctx, ms); err != nil {
+		t.Fatalf("create MachineStatus %s: %v", id, err)
+	}
+}
+
+// TestSelectAvailableMachines_MatchExpressions verifies that machineSelector
+// matchExpressions are honoured with standard Kubernetes label-selector
+// semantics, including the missing-key behaviour of NotIn and DoesNotExist.
+func TestSelectAvailableMachines_MatchExpressions(t *testing.T) {
+	ctx := context.Background()
+
+	// Fixture fleet:
+	//   metal-small   platform=metal size=small
+	//   metal-large   platform=metal size=large
+	//   aws-large     platform=aws   size=large
+	//   unlabelled    (no platform/size labels)
+	//   taken         platform=metal, but NOT available
+	setup := func(t *testing.T) *OmniClient {
+		st := newTestState()
+		createMachineStatus(ctx, t, st, "metal-small", true, map[string]string{"platform": "metal", "size": "small"})
+		createMachineStatus(ctx, t, st, "metal-large", true, map[string]string{"platform": "metal", "size": "large"})
+		createMachineStatus(ctx, t, st, "aws-large", true, map[string]string{"platform": "aws", "size": "large"})
+		createMachineStatus(ctx, t, st, "unlabelled", true, nil)
+		createMachineStatus(ctx, t, st, "taken", false, map[string]string{"platform": "metal", "size": "large"})
+		return newTestOmniClient(st)
+	}
+
+	cases := []struct {
+		name string
+		sel  metav1.LabelSelector
+		want []string
+	}{
+		{
+			name: "Exists selects only machines with the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpExists},
+			}},
+			want: []string{"aws-large", "metal-large", "metal-small"},
+		},
+		{
+			name: "DoesNotExist excludes machines with the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpDoesNotExist},
+			}},
+			want: []string{"unlabelled"},
+		},
+		{
+			name: "In with two values selects exactly the matching machines",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpIn, Values: []string{"metal", "aws"}},
+			}},
+			want: []string{"aws-large", "metal-large", "metal-small"},
+		},
+		{
+			name: "NotIn excludes listed values but includes machines lacking the key",
+			sel: metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{
+				{Key: "platform", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"aws"}},
+			}},
+			want: []string{"metal-large", "metal-small", "unlabelled"},
+		},
+		{
+			name: "matchLabels and matchExpressions AND together",
+			sel: metav1.LabelSelector{
+				MatchLabels: map[string]string{"platform": "metal"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "size", Operator: metav1.LabelSelectorOpIn, Values: []string{"large"}},
+				},
+			},
+			want: []string{"metal-large"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := setup(t)
+			got, err := c.SelectAvailableMachines(ctx, tc.sel, 10)
+			if err != nil {
+				t.Fatalf("SelectAvailableMachines: %v", err)
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("selected machines mismatch:\n  got  %v\n  want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectAvailableMachines_InvalidSelector verifies that a selector that
+// fails Kubernetes validation (In with no values) is rejected with an error.
+func TestSelectAvailableMachines_InvalidSelector(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	_, err := c.SelectAvailableMachines(ctx, metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "platform", Operator: metav1.LabelSelectorOpIn},
+		},
+	}, 10)
+	if err == nil {
+		t.Fatal("expected error for In expression without values, got nil")
+	}
+}
+
+// ── Event emission tests ──────────────────────────────────────────────────────
+
+// TestReconcileMachineSet_EmitsMachinesAllocatedEvent verifies that binding
+// fresh machines to a machine set emits a MachinesAllocated event.
+func TestReconcileMachineSet_EmitsMachinesAllocatedEvent(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	createMachineStatus(ctx, t, st, "machine-uuid-9", true, nil)
+
+	recorder := events.NewFakeRecorder(10)
+	r := &OmniClusterReconciler{OmniClient: c, Recorder: recorder}
+
+	allocated, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, "test-cluster", "test-cluster-workers",
+		omnires.LabelWorkerRole, api.MachineSetSpec{Replicas: 1})
+	if err != nil {
+		t.Fatalf("reconcileMachineSet: %v", err)
+	}
+	if len(allocated) != 1 {
+		t.Fatalf("expected 1 allocated machine, got %v", allocated)
+	}
+
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, "MachinesAllocated") {
+			t.Errorf("expected MachinesAllocated event, got %q", ev)
+		}
+	default:
+		t.Error("expected a MachinesAllocated event, got none")
 	}
 }

@@ -24,11 +24,19 @@ jobs:
       - name: Lint chart
         run: helm lint charts/omni-gitops-controller/
 
+      # Render-only check: there is no cluster in this job, and even
+      # `kubectl apply --dry-run=client` needs API discovery, so piping into
+      # kubectl can never succeed here. helm template already fails on any
+      # template error; render both the default values and the optional
+      # ServiceMonitor path.
       - name: Template chart (spot-check rendering)
         run: |
           helm template omni-gitops-controller charts/omni-gitops-controller/ \
             --set omni.endpoint=https://omni.example.com \
             --set omni.token=fake-token \
-            | kubectl apply --dry-run=client --validate=false -f -
-        env:
-          KUBECONFIG: /dev/null
+            > /dev/null
+          helm template omni-gitops-controller charts/omni-gitops-controller/ \
+            --set omni.endpoint=https://omni.example.com \
+            --set omni.token=fake-token \
+            --set metrics.serviceMonitor.enabled=true \
+            > /dev/null

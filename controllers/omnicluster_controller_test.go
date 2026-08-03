@@ -3,17 +3,28 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
 	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
+	omniSpecs "github.com/siderolabs/omni/client/api/omni/specs"
 	omniresources "github.com/siderolabs/omni/client/pkg/omni/resources"
 	omnires "github.com/siderolabs/omni/client/pkg/omni/resources/omni"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/cgoolsby/omni-gitops-controller/api/v1alpha1"
 )
@@ -192,9 +203,9 @@ func TestApplyConfigPatches_PrunesRemoved(t *testing.T) {
 
 // setupAllocatedMachine pre-creates a MachineSetNode in the in-memory state so
 // that AllocatedMachineSetNodes returns it without needing a real Omni server.
-func setupAllocatedMachine(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID string) {
+func setupAllocatedMachine(t *testing.T, ctx context.Context, c *OmniClient, clusterName, machineSetID, machineID, role string) {
 	t.Helper()
-	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, role); err != nil {
 		t.Fatalf("pre-create MachineSetNode: %v", err)
 	}
 }
@@ -210,7 +221,7 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 	machineSetID := "test-cluster-workers"
 	machineID := "machine-uuid-4"
 
-	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID)
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
 
 	r := &OmniClusterReconciler{OmniClient: c}
 
@@ -249,6 +260,60 @@ func TestReconcileMachineSet_PrunesKernelArgsWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestReconcileMachineSet_EvictionDeletesKernelArgs verifies that scaling a
+// machine set down deletes the evicted machine's KernelArgs resource, even
+// when spec.KernelArgs is still set, so the machine returns to the available
+// pool without custom kernel args.
+func TestReconcileMachineSet_EvictionDeletesKernelArgs(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-workers"
+	machineID := "machine-uuid-evict"
+
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
+
+	r := &OmniClusterReconciler{OmniClient: c}
+
+	spec := api.MachineSetSpec{
+		Replicas:   1,
+		KernelArgs: []string{"libata.force=noncq"},
+	}
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("reconcile with kernelArgs: %v", err)
+	}
+
+	// KernelArgs resource must exist.
+	kaMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, machineID, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.KernelArgs](ctx, st, kaMD); err != nil {
+		t.Fatalf("KernelArgs resource should exist after reconcile with args: %v", err)
+	}
+
+	// Scale down to 0 while still passing the same KernelArgs in the spec, so
+	// the deletion must come from the eviction path, not the prune-on-clear path.
+	spec.Replicas = 0
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("reconcile scale-down: %v", err)
+	}
+
+	// KernelArgs resource must be gone.
+	if _, err := safe.StateGet[*omnires.KernelArgs](ctx, st, kaMD); err == nil {
+		t.Errorf("KernelArgs resource should have been deleted for evicted machine %s", machineID)
+	} else if !state.IsNotFoundError(err) {
+		t.Fatalf("unexpected error checking deleted KernelArgs: %v", err)
+	}
+
+	// MachineSetNode must be gone.
+	nodeMD := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, machineID, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.MachineSetNode](ctx, st, nodeMD); err == nil {
+		t.Errorf("MachineSetNode should have been deleted for evicted machine %s", machineID)
+	} else if !state.IsNotFoundError(err) {
+		t.Fatalf("unexpected error checking deleted MachineSetNode: %v", err)
+	}
+}
+
 // TestReconcileMachineSet_PrunesExtensionsWhenEmpty verifies that when
 // spec.MachineExtensions is cleared, the ExtensionsConfiguration resource
 // for the machine set is deleted.
@@ -261,7 +326,7 @@ func TestReconcileMachineSet_PrunesExtensionsWhenEmpty(t *testing.T) {
 	machineSetID := "test-cluster-workers"
 	machineID := "machine-uuid-5"
 
-	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID)
+	setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, machineID, omnires.LabelWorkerRole)
 
 	r := &OmniClusterReconciler{OmniClient: c}
 
@@ -296,5 +361,668 @@ func TestReconcileMachineSet_PrunesExtensionsWhenEmpty(t *testing.T) {
 		t.Errorf("ExtensionsConfiguration should have been deleted when spec.MachineExtensions is empty")
 	} else if !state.IsNotFoundError(err) {
 		t.Fatalf("unexpected error checking deleted ExtensionsConfiguration: %v", err)
+	}
+}
+
+// ── reconcileMachineSet scale-down tests ──────────────────────────────────────
+
+// TestReconcileMachineSet_ControlPlaneScaleDownOneAtATime verifies that
+// control-plane scale-down removes at most one member per reconcile, so a
+// 3 → 1 scale takes two reconcile cycles instead of evicting two etcd
+// members at once.
+func TestReconcileMachineSet_ControlPlaneScaleDownOneAtATime(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-control-planes"
+
+	for i := 1; i <= 3; i++ {
+		setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, fmt.Sprintf("cp-uuid-%d", i), omnires.LabelControlPlaneRole)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	spec := api.MachineSetSpec{Replicas: 1}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelControlPlaneRole, spec); err != nil {
+		t.Fatalf("first scale-down reconcile: %v", err)
+	}
+	remaining, err := c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after first reconcile: %v", err)
+	}
+	if len(remaining) != 2 {
+		t.Fatalf("after first reconcile: got %d machines, want 2 (one member removed per cycle)", len(remaining))
+	}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelControlPlaneRole, spec); err != nil {
+		t.Fatalf("second scale-down reconcile: %v", err)
+	}
+	remaining, err = c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after second reconcile: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Errorf("after second reconcile: got %d machines, want 1", len(remaining))
+	}
+}
+
+// TestReconcileMachineSet_WorkerScaleDownBatch verifies that worker
+// scale-down still removes all excess machines in a single reconcile.
+func TestReconcileMachineSet_WorkerScaleDownBatch(t *testing.T) {
+	ctx := context.Background()
+	c := newTestOmniClient(newTestState())
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-workers"
+
+	for i := 1; i <= 3; i++ {
+		setupAllocatedMachine(t, ctx, c, clusterName, machineSetID, fmt.Sprintf("worker-uuid-%d", i), omnires.LabelWorkerRole)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	spec := api.MachineSetSpec{Replicas: 1}
+
+	if _, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, clusterName, machineSetID, omnires.LabelWorkerRole, spec); err != nil {
+		t.Fatalf("scale-down reconcile: %v", err)
+	}
+	remaining, err := c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list allocated after reconcile: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Errorf("after reconcile: got %d machines, want 1 (workers scale down in one batch)", len(remaining))
+	}
+}
+
+// ── deleteOmniResources tests ──────────────────────────────────────────────────
+
+// TestDeleteOmniResources_DeletesKubeconfigSecrets verifies that deleting an
+// OmniCluster removes both the Flux-format and ArgoCD-format kubeconfig
+// Secrets, and that a missing Secret is tolerated.
+func TestDeleteOmniResources_DeletesKubeconfigSecrets(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+
+	namespace := "flux-system"
+	clusterName := "test-cluster"
+
+	fluxSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-kubeconfig", Namespace: namespace},
+	}
+	argoSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-cluster-secret", Namespace: namespace},
+	}
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(fluxSecret, argoSecret).Build()
+
+	r := &OmniClusterReconciler{
+		Client:              kubeClient,
+		OmniClient:          c,
+		KubeconfigNamespace: namespace,
+	}
+
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName}}
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources: %v", err)
+	}
+
+	for _, name := range []string{clusterName + "-kubeconfig", clusterName + "-cluster-secret"} {
+		err := kubeClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, &corev1.Secret{})
+		if err == nil {
+			t.Errorf("secret %s should have been deleted", name)
+		} else if !apierrors.IsNotFound(err) {
+			t.Fatalf("unexpected error getting secret %s: %v", name, err)
+		}
+	}
+
+	// A second run with no Secrets present must tolerate NotFound.
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources with no secrets: %v", err)
+	}
+}
+
+// TestDeleteOmniResources_DrivenByOmniState verifies that finalizer teardown
+// discovers resources from Omni state (the authoritative source) rather than
+// status.AllocatedMachines, so a CR deleted with an empty or stale status map —
+// e.g. before its first successful reconcile — does not leak MachineSetNodes,
+// MachineSets, ConfigPatches, KernelArgs, or ExtensionsConfigurations in Omni.
+func TestDeleteOmniResources_DrivenByOmniState(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	cpSetID := clusterName + "-control-planes"
+	workerSetID := clusterName + "-workers"
+	cpMachineID := "cp-uuid-1"
+	workerMachineID := "worker-uuid-1"
+
+	if err := c.EnsureCluster(ctx, clusterName, "flux-system/"+clusterName, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("ensure cluster: %v", err)
+	}
+	sets := []struct {
+		setID, machineID, role string
+	}{
+		{cpSetID, cpMachineID, omnires.LabelControlPlaneRole},
+		{workerSetID, workerMachineID, omnires.LabelWorkerRole},
+	}
+	for _, s := range sets {
+		if err := c.EnsureMachineSet(ctx, clusterName, s.setID, s.role); err != nil {
+			t.Fatalf("ensure machine set %s: %v", s.setID, err)
+		}
+		if err := c.EnsureMachineSetNode(ctx, clusterName, s.setID, s.machineID, s.role); err != nil {
+			t.Fatalf("ensure machine set node %s: %v", s.machineID, err)
+		}
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		inline := json.RawMessage(mustJSON(map[string]any{"machine": map[string]any{"install": map[string]any{"disk": "/dev/sda"}}}))
+		if err := c.EnsureConfigPatch(ctx, patchID, clusterName, s.setID, s.machineID, inline); err != nil {
+			t.Fatalf("ensure config patch %s: %v", patchID, err)
+		}
+		if err := c.EnsureMachineKernelArgs(ctx, s.machineID, []string{"libata.force=noncq"}); err != nil {
+			t.Fatalf("ensure kernel args %s: %v", s.machineID, err)
+		}
+		if err := c.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, s.setID, []string{"siderolabs/iscsi-tools"}); err != nil {
+			t.Fatalf("ensure extensions configuration %s: %v", s.setID, err)
+		}
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 to scheme: %v", err)
+	}
+	r := &OmniClusterReconciler{
+		Client:              fake.NewClientBuilder().WithScheme(scheme).Build(),
+		OmniClient:          c,
+		KubeconfigNamespace: "flux-system",
+	}
+
+	// Status.AllocatedMachines is intentionally empty: this is the failure
+	// mode being fixed (CR deleted before status was ever populated).
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "flux-system"}}
+
+	if err := r.deleteOmniResources(ctx, cluster); err != nil {
+		t.Fatalf("deleteOmniResources: %v", err)
+	}
+
+	assertGone := func(md resource.Metadata, desc string) {
+		t.Helper()
+		_, err := st.Get(ctx, md)
+		if err == nil {
+			t.Errorf("%s should have been deleted but still exists", desc)
+		} else if !state.IsNotFoundError(err) {
+			t.Fatalf("unexpected error checking %s: %v", desc, err)
+		}
+	}
+
+	for _, s := range sets {
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, s.machineID, resource.VersionUndefined), "MachineSetNode "+s.machineID)
+		patchID := fmt.Sprintf("%s-%s-%s", clusterName, s.machineID, "install-disk")
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ConfigPatchType, patchID, resource.VersionUndefined), "ConfigPatch "+patchID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, s.machineID, resource.VersionUndefined), "KernelArgs "+s.machineID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, "schematic-"+s.setID, resource.VersionUndefined), "ExtensionsConfiguration schematic-"+s.setID)
+		assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, s.setID, resource.VersionUndefined), "MachineSet "+s.setID)
+	}
+	assertGone(resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined), "Cluster "+clusterName)
+}
+
+// ── EnsureCluster ownership tests ─────────────────────────────────────────────
+
+// TestEnsureCluster_SameOwnerUpdates verifies that the CR that created an Omni
+// cluster can keep reconciling it: repeat calls with the same owner succeed
+// and version changes propagate.
+func TestEnsureCluster_SameOwnerUpdates(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+	owner := "ns-a/prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.31.0", "v1.9.0"); err != nil {
+		t.Fatalf("update cluster with same owner: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, err := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if err != nil {
+		t.Fatalf("read back cluster: %v", err)
+	}
+	if got := stored.TypedSpec().Value.KubernetesVersion; got != "v1.31.0" {
+		t.Errorf("kubernetes version not updated: got %s, want v1.31.0", got)
+	}
+	if got := stored.TypedSpec().Value.TalosVersion; got != "v1.9.0" {
+		t.Errorf("talos version not updated: got %s, want v1.9.0", got)
+	}
+	if got, ok := stored.Metadata().Labels().Get(ownerLabel); !ok || got != owner {
+		t.Errorf("owner label = %q (present=%v), want %q", got, ok, owner)
+	}
+}
+
+// TestEnsureCluster_DifferentOwnerRefused verifies that a second OmniCluster CR
+// with the same name in another namespace cannot adopt — or modify — an Omni
+// cluster owned by the first CR.
+func TestEnsureCluster_DifferentOwnerRefused(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, "ns-a/prod", "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+
+	err := c.EnsureCluster(ctx, clusterName, "ns-b/prod", "v1.31.0", "v1.9.0")
+	if err == nil {
+		t.Fatal("expected ownership conflict error, got nil")
+	}
+	if !errors.Is(err, ErrClusterOwnershipConflict) {
+		t.Errorf("expected error wrapping ErrClusterOwnershipConflict, got: %v", err)
+	}
+
+	// The foreign CR's versions must not have been applied.
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, getErr := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if getErr != nil {
+		t.Fatalf("read back cluster: %v", getErr)
+	}
+	if got := stored.TypedSpec().Value.KubernetesVersion; got != "v1.30.0" {
+		t.Errorf("kubernetes version changed by non-owner: got %s, want v1.30.0", got)
+	}
+	if got, _ := stored.Metadata().Labels().Get(ownerLabel); got != "ns-a/prod" {
+		t.Errorf("owner label changed by non-owner: got %q, want ns-a/prod", got)
+	}
+}
+
+// TestEnsureCluster_AdoptsUnlabelledCluster verifies that an Omni cluster with
+// no owner label (pre-dating the controller or created by hand) is adopted and
+// stamped with the caller's owner identity.
+func TestEnsureCluster_AdoptsUnlabelledCluster(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+	owner := "ns-a/prod"
+
+	preexisting := omnires.NewCluster(clusterName)
+	preexisting.TypedSpec().Value.KubernetesVersion = "v1.30.0"
+	preexisting.TypedSpec().Value.TalosVersion = "v1.8.0"
+	if err := st.Create(ctx, preexisting); err != nil {
+		t.Fatalf("pre-create unlabelled cluster: %v", err)
+	}
+
+	if err := c.EnsureCluster(ctx, clusterName, owner, "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("EnsureCluster should adopt unlabelled cluster: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	stored, err := safe.StateGet[*omnires.Cluster](ctx, st, md)
+	if err != nil {
+		t.Fatalf("read back cluster: %v", err)
+	}
+	if got, ok := stored.Metadata().Labels().Get(ownerLabel); !ok || got != owner {
+		t.Errorf("owner label after adoption = %q (present=%v), want %q", got, ok, owner)
+	}
+}
+
+// TestDeleteOmniResources_SkipsForeignOwnedCluster verifies that deleting an
+// OmniCluster CR does not tear down an Omni cluster owned by a different CR
+// with the same name in another namespace.
+func TestDeleteOmniResources_SkipsForeignOwnedCluster(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "prod"
+
+	if err := c.EnsureCluster(ctx, clusterName, "ns-a/prod", "v1.30.0", "v1.8.0"); err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+
+	r := &OmniClusterReconciler{OmniClient: c}
+	foreignCR := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "ns-b"}}
+
+	if err := r.deleteOmniResources(ctx, foreignCR); err != nil {
+		t.Fatalf("deleteOmniResources should skip foreign-owned cluster without error: %v", err)
+	}
+
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	if _, err := safe.StateGet[*omnires.Cluster](ctx, st, md); err != nil {
+		t.Errorf("foreign-owned cluster should still exist after skipped teardown: %v", err)
+	}
+}
+
+// ── GetDriftingMachines tests ──────────────────────────────────────────────────
+
+// createClusterMachineStatus inserts a ClusterMachineStatus fixture into the
+// in-memory state, labelled with the cluster.
+func createClusterMachineStatus(ctx context.Context, t *testing.T, st state.State, clusterName, machineID string, stage omniSpecs.ClusterMachineStatusSpec_Stage, ready, configUpToDate bool) {
+	t.Helper()
+	cms := omnires.NewClusterMachineStatus(machineID)
+	cms.Metadata().Labels().Set(omnires.LabelCluster, clusterName)
+	spec := cms.TypedSpec().Value
+	spec.Stage = stage
+	spec.Ready = ready
+	spec.ConfigUpToDate = configUpToDate
+	spec.ManagementAddress = "10.0.0.1"
+	if err := st.Create(ctx, cms); err != nil {
+		t.Fatalf("create ClusterMachineStatus %s: %v", machineID, err)
+	}
+}
+
+// TestGetDriftingMachines_AllHealthyOneDrifting verifies that when every
+// machine in the cluster is RUNNING+Ready, a drifting machine is returned
+// as a reboot candidate.
+func TestGetDriftingMachines_AllHealthyOneDrifting(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-a", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, false)
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-b", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+	createClusterMachineStatus(ctx, t, st, clusterName, "machine-c", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+
+	drifting, err := c.GetDriftingMachines(ctx, clusterName)
+	if err != nil {
+		t.Fatalf("GetDriftingMachines: %v", err)
+	}
+
+	if len(drifting) != 1 {
+		t.Fatalf("expected 1 drifting machine, got %d: %v", len(drifting), drifting)
+	}
+	if drifting[0].MachineID != "machine-a" {
+		t.Errorf("expected drifting machine machine-a, got %s", drifting[0].MachineID)
+	}
+}
+
+// TestGetDriftingMachines_UnhealthyMachineBlocksReboots verifies the
+// cluster-wide health gate: if any machine is not RUNNING+Ready (e.g. still
+// mid-reboot from a previous drift correction), no reboot candidates are
+// returned even when another healthy machine is drifting.
+func TestGetDriftingMachines_UnhealthyMachineBlocksReboots(t *testing.T) {
+	ctx := context.Background()
+
+	cases := []struct {
+		name  string
+		stage omniSpecs.ClusterMachineStatusSpec_Stage
+		ready bool
+	}{
+		{name: "non-running stage", stage: omniSpecs.ClusterMachineStatusSpec_REBOOTING, ready: false},
+		{name: "running but not ready", stage: omniSpecs.ClusterMachineStatusSpec_RUNNING, ready: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestState()
+			c := newTestOmniClient(st)
+
+			clusterName := "test-cluster"
+			// machine-a is unhealthy (e.g. just rebooted by the previous cycle).
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-a", tc.stage, tc.ready, true)
+			// machine-b is healthy and drifting.
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-b", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, false)
+			createClusterMachineStatus(ctx, t, st, clusterName, "machine-c", omniSpecs.ClusterMachineStatusSpec_RUNNING, true, true)
+
+			drifting, err := c.GetDriftingMachines(ctx, clusterName)
+			if err != nil {
+				t.Fatalf("GetDriftingMachines: %v", err)
+			}
+			if len(drifting) != 0 {
+				t.Errorf("expected no reboot candidates while a machine is unhealthy, got %v", drifting)
+			}
+		})
+	}
+}
+
+// ── selectRebootCandidate tests ───────────────────────────────────────────────
+
+func TestSelectRebootCandidate(t *testing.T) {
+	now := time.Now()
+	machineA := MachineConfigDrift{MachineID: "machine-a", ManagementAddress: "10.0.0.1"}
+	machineB := MachineConfigDrift{MachineID: "machine-b", ManagementAddress: "10.0.0.2"}
+
+	cases := []struct {
+		name        string
+		drifting    []MachineConfigDrift
+		lastReboots map[string]metav1.Time
+		want        *MachineConfigDrift
+	}{
+		{
+			name:        "no prior reboot recorded returns first drifting machine",
+			drifting:    []MachineConfigDrift{machineA, machineB},
+			lastReboots: nil,
+			want:        &machineA,
+		},
+		{
+			name:     "machine in cooldown is skipped in favor of one with no record",
+			drifting: []MachineConfigDrift{machineA, machineB},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-1 * time.Minute)),
+			},
+			want: &machineB,
+		},
+		{
+			name:     "all drifting machines within cooldown returns nil",
+			drifting: []MachineConfigDrift{machineA, machineB},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-1 * time.Minute)),
+				"machine-b": metav1.NewTime(now.Add(-9 * time.Minute)),
+			},
+			want: nil,
+		},
+		{
+			name:     "reboot older than cooldown makes machine eligible again",
+			drifting: []MachineConfigDrift{machineA},
+			lastReboots: map[string]metav1.Time{
+				"machine-a": metav1.NewTime(now.Add(-rebootCooldown - time.Second)),
+			},
+			want: &machineA,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectRebootCandidate(tc.drifting, tc.lastReboots, now)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("expected no candidate, got %v", got)
+			case tc.want != nil && got == nil:
+				t.Errorf("expected candidate %s, got nil", tc.want.MachineID)
+			case tc.want != nil && got.MachineID != tc.want.MachineID:
+				t.Errorf("expected candidate %s, got %s", tc.want.MachineID, got.MachineID)
+			}
+		})
+	}
+}
+
+// ── statusNeedsUpdate tests ───────────────────────────────────────────────────
+
+// TestStatusNeedsUpdate verifies the conditional-update decision that breaks
+// the watch-driven hot loop: re-deriving an identical status (including
+// conditions re-set via meta.SetStatusCondition) must not trigger a write,
+// while any real change must.
+func TestStatusNeedsUpdate(t *testing.T) {
+	transition := metav1.NewTime(time.Now().Add(-time.Hour).Truncate(time.Second))
+	baseStatus := func() *api.OmniClusterStatus {
+		return &api.OmniClusterStatus{
+			Phase: "Running",
+			Ready: true,
+			AllocatedMachines: map[string][]string{
+				"cp": {"machine-a"},
+			},
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionTrue,
+				Reason:             "Running",
+				Message:            "Omni cluster phase: Running",
+				LastTransitionTime: transition,
+			}},
+		}
+	}
+
+	t.Run("identical status needs no update", func(t *testing.T) {
+		if statusNeedsUpdate(baseStatus(), baseStatus()) {
+			t.Error("expected no update for identical statuses")
+		}
+	})
+
+	t.Run("re-setting an unchanged condition needs no update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		meta.SetStatusCondition(&after.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionTrue,
+			Reason:  "Running",
+			Message: "Omni cluster phase: Running",
+		})
+		if statusNeedsUpdate(before, after) {
+			t.Error("expected no update when condition is re-set with identical values")
+		}
+		if !after.Conditions[0].LastTransitionTime.Equal(&transition) {
+			t.Errorf("LastTransitionTime changed without a transition: %v", after.Conditions[0].LastTransitionTime)
+		}
+	})
+
+	t.Run("condition transition needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		meta.SetStatusCondition(&after.Conditions, metav1.Condition{
+			Type:    "Ready",
+			Status:  metav1.ConditionFalse,
+			Reason:  "ScalingUp",
+			Message: "Omni cluster phase: ScalingUp",
+		})
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when condition status transitions")
+		}
+		if after.Conditions[0].LastTransitionTime.Equal(&transition) {
+			t.Error("LastTransitionTime should be re-stamped on a transition")
+		}
+	})
+
+	t.Run("field change needs update", func(t *testing.T) {
+		before := baseStatus()
+		after := before.DeepCopy()
+		after.Phase = "Destroying"
+		if !statusNeedsUpdate(before, after) {
+			t.Error("expected update when a status field changes")
+		}
+	})
+}
+
+// ── secretNeedsRefresh tests ───────────────────────────────────────────────────
+
+func TestSecretNeedsRefresh(t *testing.T) {
+	now := time.Now()
+
+	newSecret := func(data map[string][]byte, annotations map[string]string) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Annotations: annotations},
+			Data:       data,
+		}
+	}
+
+	t.Run("nil secret needs refresh", func(t *testing.T) {
+		if !secretNeedsRefresh(nil, "value", now) {
+			t.Error("expected nil secret to need refresh")
+		}
+	})
+
+	t.Run("missing data key needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"other": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Format(time.RFC3339),
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret without data key to need refresh")
+		}
+	})
+
+	t.Run("missing annotation needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, nil)
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret without refresh annotation to need refresh")
+		}
+	})
+
+	t.Run("fresh annotation does not need refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Add(-time.Hour).Format(time.RFC3339),
+		})
+		if secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected 1-hour-old secret to not need refresh")
+		}
+	})
+
+	t.Run("annotation older than interval needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: now.Add(-kubeconfigRefreshInterval - time.Hour).Format(time.RFC3339),
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret older than refresh interval to need refresh")
+		}
+	})
+
+	t.Run("unparsable annotation needs refresh", func(t *testing.T) {
+		secret := newSecret(map[string][]byte{"value": []byte("x")}, map[string]string{
+			kubeconfigRefreshedAtAnnotation: "not-a-timestamp",
+		})
+		if !secretNeedsRefresh(secret, "value", now) {
+			t.Error("expected secret with unparsable annotation to need refresh")
+		}
+	})
+}
+
+// ── EnsureMachineSetNode conflict tests ───────────────────────────────────────
+
+// TestEnsureMachineSetNode_IdempotentSameSet verifies that re-binding a machine
+// to the machine set it is already bound to succeeds without error.
+func TestEnsureMachineSetNode_IdempotentSameSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "cluster-a"
+	machineSetID := "cluster-a-workers"
+	machineID := "m1"
+
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+		t.Fatalf("first EnsureMachineSetNode: %v", err)
+	}
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, omnires.LabelWorkerRole); err != nil {
+		t.Errorf("second EnsureMachineSetNode for the same set should be idempotent, got: %v", err)
+	}
+}
+
+// TestEnsureMachineSetNode_ConflictDifferentSet verifies that binding a machine
+// already owned by another machine set fails loudly instead of silently
+// counting the machine as allocated to the new set.
+func TestEnsureMachineSetNode_ConflictDifferentSet(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	machineID := "m1"
+
+	if err := c.EnsureMachineSetNode(ctx, "cluster-a", "cluster-a-workers", machineID, omnires.LabelWorkerRole); err != nil {
+		t.Fatalf("bind to cluster-a-workers: %v", err)
+	}
+
+	err := c.EnsureMachineSetNode(ctx, "cluster-b", "cluster-b-workers", machineID, omnires.LabelWorkerRole)
+	if err == nil {
+		t.Fatal("expected error binding machine already owned by cluster-a-workers, got nil")
+	}
+	if !strings.Contains(err.Error(), "cluster-a-workers") {
+		t.Errorf("error should name the conflicting machine set cluster-a-workers, got: %v", err)
 	}
 }

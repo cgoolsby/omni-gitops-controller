@@ -1,4 +1,5 @@
 // Package v1alpha1 contains API schema definitions for omni.gitops.dev/v1alpha1.
+// +kubebuilder:object:generate=true
 // +groupName=omni.gitops.dev
 package v1alpha1
 

@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -46,7 +47,12 @@ type MachineConfigDrift struct {
 }
 
 // GetDriftingMachines returns machines in the cluster whose running config does not match the desired
-// config (ConfigUpToDate==false), are in the RUNNING stage, are healthy, and have no config error.
+// config (ConfigUpToDate==false) and have no config error.
+//
+// Precondition: every machine in the cluster must be healthy (RUNNING stage and Ready). If any
+// machine is unhealthy — e.g. still mid-reboot from a previous drift correction — it is not safe
+// to take another machine down, so an empty list is returned and no reboot candidates are offered
+// this cycle.
 func (c *OmniClient) GetDriftingMachines(ctx context.Context, clusterName string) ([]MachineConfigDrift, error) {
 	list, err := safe.StateListAll[*omnires.ClusterMachineStatus](ctx, c.state,
 		state.WithLabelQuery(resource.LabelEqual(omnires.LabelCluster, clusterName)),
@@ -55,14 +61,22 @@ func (c *OmniClient) GetDriftingMachines(ctx context.Context, clusterName string
 		return nil, fmt.Errorf("list cluster machine statuses for %s: %w", clusterName, err)
 	}
 
+	allHealthy := true
+	list.ForEach(func(cms *omnires.ClusterMachineStatus) {
+		spec := cms.TypedSpec().Value
+		if spec.Stage != omniSpecs.ClusterMachineStatusSpec_RUNNING || !spec.Ready {
+			allHealthy = false
+		}
+	})
+	if !allHealthy {
+		return nil, nil
+	}
+
 	var drifting []MachineConfigDrift
 
 	list.ForEach(func(cms *omnires.ClusterMachineStatus) {
 		spec := cms.TypedSpec().Value
-		if !spec.ConfigUpToDate &&
-			spec.Stage == omniSpecs.ClusterMachineStatusSpec_RUNNING &&
-			spec.Ready &&
-			spec.LastConfigError == "" {
+		if !spec.ConfigUpToDate && spec.LastConfigError == "" {
 			drifting = append(drifting, MachineConfigDrift{
 				MachineID:         cms.Metadata().ID(),
 				ManagementAddress: spec.ManagementAddress,
@@ -91,13 +105,30 @@ type ClusterStatus struct {
 	Ready bool // true when Omni reports kubernetesAPIReady
 }
 
-// EnsureCluster creates or updates the Omni Cluster resource.
-func (c *OmniClient) EnsureCluster(ctx context.Context, name, kubeVersion, talosVersion string) error {
+// ownerLabel records which OmniCluster CR (<namespace>/<name>) manages an Omni
+// Cluster resource, so two CRs with the same name in different namespaces
+// cannot silently adopt — and fight over — the same Omni cluster.
+const ownerLabel = "omni.gitops.dev/owner"
+
+// ErrClusterOwnershipConflict is wrapped into the error returned by
+// EnsureCluster when the Omni cluster is already owned by a different
+// OmniCluster CR. Detect it with errors.Is.
+var ErrClusterOwnershipConflict = errors.New("omni cluster ownership conflict")
+
+// EnsureCluster creates or updates the Omni Cluster resource. owner is the
+// <namespace>/<name> of the OmniCluster CR driving this call.
+//
+// An existing cluster whose ownerLabel matches owner is updated as usual. A
+// cluster without the label (pre-dating this controller or created by hand) is
+// adopted: the label is stamped onto it. A cluster owned by a different CR is
+// left untouched and an error wrapping ErrClusterOwnershipConflict is returned.
+func (c *OmniClient) EnsureCluster(ctx context.Context, name, owner, kubeVersion, talosVersion string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, name, resource.VersionUndefined)
 	existing, err := safe.StateGet[*omnires.Cluster](ctx, c.state, md)
 
 	if state.IsNotFoundError(err) {
 		cluster := omnires.NewCluster(name)
+		cluster.Metadata().Labels().Set(ownerLabel, owner)
 		cluster.TypedSpec().Value.KubernetesVersion = kubeVersion
 		cluster.TypedSpec().Value.TalosVersion = talosVersion
 		return c.state.Create(ctx, cluster)
@@ -106,13 +137,41 @@ func (c *OmniClient) EnsureCluster(ctx context.Context, name, kubeVersion, talos
 		return fmt.Errorf("get cluster: %w", err)
 	}
 
+	currentOwner, hasOwner := existing.Metadata().Labels().Get(ownerLabel)
+	if hasOwner && currentOwner != owner {
+		return fmt.Errorf("%w: omni cluster %q is owned by %s, refusing to adopt (this OmniCluster is %s)",
+			ErrClusterOwnershipConflict, name, currentOwner, owner)
+	}
+
+	needsUpdate := !hasOwner
+	if !hasOwner {
+		existing.Metadata().Labels().Set(ownerLabel, owner)
+	}
 	if existing.TypedSpec().Value.KubernetesVersion != kubeVersion ||
 		existing.TypedSpec().Value.TalosVersion != talosVersion {
 		existing.TypedSpec().Value.KubernetesVersion = kubeVersion
 		existing.TypedSpec().Value.TalosVersion = talosVersion
+		needsUpdate = true
+	}
+	if needsUpdate {
 		return c.state.Update(ctx, existing)
 	}
 	return nil
+}
+
+// ClusterOwner returns the ownerLabel value on the Omni Cluster resource.
+// ok is false when the cluster does not exist or carries no owner label.
+func (c *OmniClient) ClusterOwner(ctx context.Context, clusterName string) (owner string, ok bool, err error) {
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
+	existing, err := safe.StateGet[*omnires.Cluster](ctx, c.state, md)
+	if state.IsNotFoundError(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get cluster %s: %w", clusterName, err)
+	}
+	owner, ok = existing.Metadata().Labels().Get(ownerLabel)
+	return owner, ok, nil
 }
 
 // EnsureMachineSet creates the named MachineSet in Omni if it does not already exist.
@@ -167,6 +226,23 @@ func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.Lab
 	return ids, nil
 }
 
+// ListMachineSetIDsForCluster returns the IDs of all Omni MachineSets labelled
+// with the given cluster.
+func (c *OmniClient) ListMachineSetIDsForCluster(ctx context.Context, clusterName string) ([]string, error) {
+	list, err := safe.StateListAll[*omnires.MachineSet](ctx, c.state,
+		state.WithLabelQuery(resource.LabelEqual(omnires.LabelCluster, clusterName)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list machine sets for %s: %w", clusterName, err)
+	}
+
+	var ids []string
+	list.ForEach(func(ms *omnires.MachineSet) {
+		ids = append(ids, ms.Metadata().ID())
+	})
+	return ids, nil
+}
+
 // AllocatedMachineSetNodes lists machine UUIDs already bound to a MachineSet.
 func (c *OmniClient) AllocatedMachineSetNodes(ctx context.Context, machineSetID string) ([]string, error) {
 	list, err := safe.StateListAll[*omnires.MachineSetNode](ctx, c.state,
@@ -190,8 +266,29 @@ func (c *OmniClient) EnsureMachineSetNode(ctx context.Context, clusterName, mach
 	ms.Metadata().Labels().Set(role, "")
 
 	node := omnires.NewMachineSetNode(machineID, ms)
-	if err := c.state.Create(ctx, node); err != nil && !state.IsConflictError(err) {
-		return fmt.Errorf("create machine set node %s in %s: %w", machineID, machineSetID, err)
+	if err := c.state.Create(ctx, node); err != nil {
+		if !state.IsConflictError(err) {
+			return fmt.Errorf("create machine set node %s in %s: %w", machineID, machineSetID, err)
+		}
+
+		// A MachineSetNode with this ID already exists. NewMachineSetNode stamps
+		// LabelMachineSet with the owning MachineSet's ID, so check the existing
+		// resource really belongs to this set — otherwise the machine was bound
+		// elsewhere (another OmniCluster, the Omni UI) between selection and Create,
+		// and counting it as ours would silently diverge from reality.
+		md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, machineID, resource.VersionUndefined)
+		existing, getErr := safe.StateGet[*omnires.MachineSetNode](ctx, c.state, md)
+		if getErr != nil {
+			return fmt.Errorf("verify existing machine set node %s: %w", machineID, getErr)
+		}
+
+		boundSet, ok := existing.Metadata().Labels().Get(omnires.LabelMachineSet)
+		if !ok {
+			return fmt.Errorf("machine %s already has a machine set node without a %s label, cannot bind to %s", machineID, omnires.LabelMachineSet, machineSetID)
+		}
+		if boundSet != machineSetID {
+			return fmt.Errorf("machine %s is already bound to machine set %s, cannot bind to %s", machineID, boundSet, machineSetID)
+		}
 	}
 	return nil
 }
@@ -443,8 +540,9 @@ func (c *OmniClient) DeleteCluster(ctx context.Context, clusterName string) erro
 }
 
 // GetKubeconfig fetches a service-account kubeconfig from Omni for the named cluster
-// via the management API. The token TTL is 90 days; ensureKubeconfigSecret refreshes
-// it on every reconcile so the actual expiry window is just a safety margin.
+// via the management API. The token TTL is 90 days; the ensure functions re-fetch it
+// only when the stored Secret is older than kubeconfigRefreshInterval (30 days), so
+// the token is always replaced well before it expires.
 func (c *OmniClient) GetKubeconfig(ctx context.Context, clusterName string) ([]byte, error) {
 	data, err := c.mgmt.WithCluster(clusterName).Kubeconfig(ctx,
 		management.WithServiceAccount(90*24*time.Hour, "flux-admin", "system:masters"),

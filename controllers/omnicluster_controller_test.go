@@ -24,7 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1292,7 +1292,7 @@ func TestReconcileMachineSet_EmitsMachinesAllocatedEvent(t *testing.T) {
 
 	createMachineStatus(ctx, t, st, "machine-uuid-9", true, nil)
 
-	recorder := record.NewFakeRecorder(10)
+	recorder := events.NewFakeRecorder(10)
 	r := &OmniClusterReconciler{OmniClient: c, Recorder: recorder}
 
 	allocated, err := r.reconcileMachineSet(ctx, &api.OmniCluster{}, "test-cluster", "test-cluster-workers",

@@ -18,7 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -48,7 +48,7 @@ type OmniClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	OmniClient          *OmniClient
-	Recorder            record.EventRecorder
+	Recorder            events.EventRecorder
 	KubeconfigNamespace string
 	ArgoCDClusters      bool
 }
@@ -57,7 +57,9 @@ type OmniClusterReconciler struct {
 // construct the reconciler without a manager), in which case this is a no-op.
 func (r *OmniClusterReconciler) eventf(cluster *api.OmniCluster, eventType, reason, format string, args ...any) {
 	if r.Recorder != nil {
-		r.Recorder.Eventf(cluster, eventType, reason, format, args...)
+		// The new events API adds a related object and an action; we have no
+		// secondary object, and the reason doubles as the action.
+		r.Recorder.Eventf(cluster, nil, eventType, reason, reason, format, args...)
 	}
 }
 

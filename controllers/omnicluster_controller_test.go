@@ -1313,3 +1313,55 @@ func TestReconcileMachineSet_EmitsMachinesAllocatedEvent(t *testing.T) {
 		t.Error("expected a MachinesAllocated event, got none")
 	}
 }
+
+// ── teardownAndDestroy finalizer tests ────────────────────────────────────────
+
+// TestDeleteExtensionsConfiguration_WithFinalizer is a regression test for the
+// v0.2.0 orphan-prune failure: Omni's MachineExtensionsController holds a
+// finalizer on ExtensionsConfiguration, so a bare Destroy fails with
+// FailedPrecondition. Deletion must Teardown first, surface a retryable error
+// while the finalizer is held, and complete once it is released.
+func TestDeleteExtensionsConfiguration_WithFinalizer(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := "test-cluster-gpu"
+
+	if err := c.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, machineSetID,
+		[]string{"siderolabs/nvidia-open-gpu-kernel-modules"}); err != nil {
+		t.Fatalf("create extensions configuration: %v", err)
+	}
+
+	// Simulate Omni's controller holding a finalizer.
+	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType,
+		"schematic-"+machineSetID, resource.VersionUndefined)
+	if err := st.AddFinalizer(ctx, md, "MachineExtensionsController"); err != nil {
+		t.Fatalf("add finalizer: %v", err)
+	}
+
+	// First attempt: teardown starts, finalizer still held → retryable error.
+	err := c.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID)
+	if err == nil {
+		t.Fatal("expected retryable error while finalizer is held, got nil")
+	}
+
+	// Omni's controller reacts to the teardown by releasing its finalizer.
+	if err := st.RemoveFinalizer(ctx, md, "MachineExtensionsController"); err != nil {
+		t.Fatalf("remove finalizer: %v", err)
+	}
+
+	// Retry (as controller-runtime would): deletion now completes.
+	if err := c.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+		t.Fatalf("delete after finalizer released: %v", err)
+	}
+	if _, err := safe.StateGet[*omnires.ExtensionsConfiguration](ctx, st, md); !state.IsNotFoundError(err) {
+		t.Fatalf("extensions configuration should be gone, got err=%v", err)
+	}
+
+	// Idempotency: deleting again is a no-op.
+	if err := c.DeleteExtensionsConfigurationForMachineSet(ctx, machineSetID); err != nil {
+		t.Fatalf("delete of missing resource should be nil, got %v", err)
+	}
+}

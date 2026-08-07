@@ -192,13 +192,34 @@ func (c *OmniClient) EnsureMachineSet(ctx context.Context, clusterName, machineS
 	return c.state.Create(ctx, ms)
 }
 
+// teardownAndDestroy removes an Omni resource honouring COSI finalizer
+// semantics: Teardown marks the resource so the owning Omni controller releases
+// its finalizers, then Destroy removes it. While teardown is in progress a
+// retryable error is returned so controller-runtime requeues; a missing
+// resource counts as already deleted. Destroying directly without Teardown
+// fails with FailedPrecondition on any resource an Omni controller holds a
+// finalizer on (e.g. MachineExtensionsController on ExtensionsConfiguration).
+func (c *OmniClient) teardownAndDestroy(ctx context.Context, md resource.Metadata, desc string) error {
+	ready, err := c.state.Teardown(ctx, md)
+	if err != nil {
+		if state.IsNotFoundError(err) {
+			return nil
+		}
+		return fmt.Errorf("teardown %s: %w", desc, err)
+	}
+	if !ready {
+		return fmt.Errorf("%s teardown in progress, will retry", desc)
+	}
+	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
+		return fmt.Errorf("destroy %s: %w", desc, err)
+	}
+	return nil
+}
+
 // DeleteMachineSet removes a MachineSet from Omni if it exists.
 func (c *OmniClient) DeleteMachineSet(ctx context.Context, machineSetID string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetType, machineSetID, resource.VersionUndefined)
-	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-		return fmt.Errorf("delete machine set %s: %w", machineSetID, err)
-	}
-	return nil
+	return c.teardownAndDestroy(ctx, md, fmt.Sprintf("machine set %s", machineSetID))
 }
 
 // SelectAvailableMachines lists Omni MachineStatuses matching the selector
@@ -325,22 +346,7 @@ func (c *OmniClient) EnsureMachineSetNode(ctx context.Context, clusterName, mach
 // an error so controller-runtime requeues and retries on the next cycle.
 func (c *OmniClient) DeleteMachineSetNode(ctx context.Context, machineID string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.MachineSetNodeType, machineID, resource.VersionUndefined)
-
-	ready, err := c.state.Teardown(ctx, md)
-	if err != nil {
-		if state.IsNotFoundError(err) {
-			return nil
-		}
-		return fmt.Errorf("teardown machine set node %s: %w", machineID, err)
-	}
-	if !ready {
-		return fmt.Errorf("machine set node %s teardown in progress, will retry", machineID)
-	}
-
-	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-		return fmt.Errorf("delete machine set node %s: %w", machineID, err)
-	}
-	return nil
+	return c.teardownAndDestroy(ctx, md, fmt.Sprintf("machine set node %s", machineID))
 }
 
 // EnsureConfigPatch creates or updates a Talos config patch for a machine in Omni.
@@ -466,10 +472,7 @@ func jsonEqual(a, b []byte) bool {
 // Called when spec.KernelArgs is cleared so the previously-applied args are revoked.
 func (c *OmniClient) DeleteKernelArgsForMachine(ctx context.Context, machineID string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.KernelArgsType, machineID, resource.VersionUndefined)
-	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-		return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
-	}
-	return nil
+	return c.teardownAndDestroy(ctx, md, fmt.Sprintf("kernel args for machine %s", machineID))
 }
 
 // DeleteExtensionsConfigurationForMachineSet removes the ExtensionsConfiguration resource
@@ -477,10 +480,7 @@ func (c *OmniClient) DeleteKernelArgsForMachine(ctx context.Context, machineID s
 func (c *OmniClient) DeleteExtensionsConfigurationForMachineSet(ctx context.Context, machineSetID string) error {
 	id := "schematic-" + machineSetID
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ExtensionsConfigurationType, id, resource.VersionUndefined)
-	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-		return fmt.Errorf("delete extensions configuration for machine set %s: %w", machineSetID, err)
-	}
-	return nil
+	return c.teardownAndDestroy(ctx, md, fmt.Sprintf("extensions configuration for machine set %s", machineSetID))
 }
 
 // DeleteConfigPatchesForMachine removes all ConfigPatches scoped to a specific machine.
@@ -498,8 +498,8 @@ func (c *OmniClient) DeleteConfigPatchesForMachine(ctx context.Context, clusterN
 	var errs []error
 	list.ForEach(func(p *omnires.ConfigPatch) {
 		md := p.Metadata()
-		if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-			errs = append(errs, fmt.Errorf("delete config patch %s: %w", md.ID(), err))
+		if err := c.teardownAndDestroy(ctx, *md, fmt.Sprintf("config patch %s", md.ID())); err != nil {
+			errs = append(errs, err)
 		}
 	})
 
@@ -526,8 +526,8 @@ func (c *OmniClient) PruneOrphanedConfigPatches(ctx context.Context, clusterName
 	list.ForEach(func(p *omnires.ConfigPatch) {
 		id := p.Metadata().ID()
 		if _, keep := keepIDs[id]; !keep {
-			if err := c.state.Destroy(ctx, p.Metadata()); err != nil && !state.IsNotFoundError(err) {
-				errs = append(errs, fmt.Errorf("delete orphaned config patch %s: %w", id, err))
+			if err := c.teardownAndDestroy(ctx, *p.Metadata(), fmt.Sprintf("orphaned config patch %s", id)); err != nil {
+				errs = append(errs, err)
 			}
 		}
 	})
@@ -559,10 +559,7 @@ func (c *OmniClient) GetClusterStatus(ctx context.Context, clusterName string) (
 // DeleteCluster removes the Omni Cluster resource.
 func (c *OmniClient) DeleteCluster(ctx context.Context, clusterName string) error {
 	md := resource.NewMetadata(omniresources.DefaultNamespace, omnires.ClusterType, clusterName, resource.VersionUndefined)
-	if err := c.state.Destroy(ctx, md); err != nil && !state.IsNotFoundError(err) {
-		return fmt.Errorf("delete cluster %s: %w", clusterName, err)
-	}
-	return nil
+	return c.teardownAndDestroy(ctx, md, fmt.Sprintf("cluster %s", clusterName))
 }
 
 // GetKubeconfig fetches a service-account kubeconfig from Omni for the named cluster

@@ -79,11 +79,6 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Snapshot status so the write at the end can be skipped when nothing
-	// changed: an unconditional status update fires a watch event on our own
-	// CR, which would retrigger reconcile in a tight loop.
-	statusBefore := cluster.Status.DeepCopy()
-
 	// ── Delete path ───────────────────────────────────────────────────────────
 	if !cluster.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(cluster, finalizerName) {
@@ -108,49 +103,24 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Snapshot status so the write at the end can be skipped when nothing
+	// changed: an unconditional status update fires a watch event on our own
+	// CR, which would retrigger reconcile in a tight loop.
+	statusBefore := cluster.Status.DeepCopy()
+
 	// ── Reconcile Omni resources ──────────────────────────────────────────────
 	clusterName := cluster.Name
 
-	if err := r.OmniClient.EnsureCluster(ctx,
-		clusterName,
-		ownerOf(cluster),
-		cluster.Spec.KubernetesVersion,
-		cluster.Spec.TalosVersion,
-	); err != nil {
-		reason := "EnsureClusterFailed"
-		if goerrors.Is(err, ErrClusterOwnershipConflict) {
-			reason = "ClusterOwnershipConflict"
-		}
-		return r.setFailure(ctx, cluster, statusBefore, reason, err)
-	}
-
-	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
-	if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, cpMachineSetID, omnires.LabelControlPlaneRole); err != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "EnsureMachineSetFailed", err)
+	if result, err := r.ensureCluster(ctx, cluster, statusBefore, clusterName); err != nil {
+		return result, err
 	}
 
 	allocatedMachines := map[string][]string{}
-
-	// Allocate control plane machines.
-	if allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, cpMachineSetID,
-		omnires.LabelControlPlaneRole, cluster.Spec.ControlPlane); err != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
-	} else {
-		allocatedMachines[cpMachineSetID] = allocated
+	if result, err := r.allocateControlPlaneMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); err != nil {
+		return result, err
 	}
-
-	// Allocate worker machines.
-	for _, w := range cluster.Spec.Workers {
-		wID := fmt.Sprintf("%s-%s", clusterName, w.Name)
-		if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, wID, omnires.LabelWorkerRole); err != nil {
-			return r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
-		}
-		if allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, wID,
-			omnires.LabelWorkerRole, w.MachineSetSpec); err != nil {
-			return r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
-		} else {
-			allocatedMachines[wID] = allocated
-		}
+	if result, err := r.allocateWorkerMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); err != nil {
+		return result, err
 	}
 
 	// Prune machine sets that exist in Omni but are no longer declared in spec.
@@ -165,6 +135,23 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		return r.setFailure(ctx, cluster, statusBefore, "GetStatusFailed", err)
 	}
+
+	// Record status from Omni before the drift check below, which can itself
+	// fail and return early: that must not strand this already-fetched Phase
+	// and AllocatedMachines behind a stale value from a prior reconcile.
+	cluster.Status.ObservedGeneration = cluster.Generation
+	cluster.Status.Phase = omniStatus.Phase
+	cluster.Status.Ready = omniStatus.Ready
+	cluster.Status.AllocatedMachines = allocatedMachines
+	cluster.Status.FailureReason = nil
+	cluster.Status.FailureMessage = nil
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             boolToConditionStatus(omniStatus.Ready),
+		Reason:             omniStatus.Phase,
+		Message:            fmt.Sprintf("Omni cluster phase: %s", omniStatus.Phase),
+		ObservedGeneration: cluster.Generation,
+	})
 
 	clusterReadyGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(omniStatus.Ready))
 
@@ -187,20 +174,6 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 	clusterConfigDriftGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(len(drifting) > 0))
-
-	cluster.Status.ObservedGeneration = cluster.Generation
-	cluster.Status.Phase = omniStatus.Phase
-	cluster.Status.Ready = omniStatus.Ready
-	cluster.Status.AllocatedMachines = allocatedMachines
-	cluster.Status.FailureReason = nil
-	cluster.Status.FailureMessage = nil
-	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             boolToConditionStatus(omniStatus.Ready),
-		Reason:             omniStatus.Phase,
-		Message:            fmt.Sprintf("Omni cluster phase: %s", omniStatus.Phase),
-		ObservedGeneration: cluster.Generation,
-	})
 
 	// Prune reboot bookkeeping for machines no longer allocated to this cluster.
 	allocatedSet := map[string]bool{}
@@ -233,12 +206,6 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", rebootCandidate.MachineID),
 			ObservedGeneration: cluster.Generation,
 		})
-		// Record the attempt time before issuing the reboot: even if the RPC
-		// later fails, the machine should not be hammered every cycle.
-		if cluster.Status.LastRebootTimes == nil {
-			cluster.Status.LastRebootTimes = map[string]metav1.Time{}
-		}
-		cluster.Status.LastRebootTimes[rebootCandidate.MachineID] = now
 	} else {
 		waiting := make([]string, 0, len(drifting))
 		for _, d := range drifting {
@@ -255,6 +222,48 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			"Machine(s) %s still drifting after a recent reboot; waiting for the %s cooldown", strings.Join(waiting, ", "), rebootCooldown)
 	}
 
+	// Every Omni-side action this reconcile needs to perform (kubeconfig, reboot)
+	// runs here, before the single status write below, so that write always
+	// reflects this pass's fully settled outcome instead of a still-pending
+	// intent, and no later pass needs to discover an action was never taken.
+	rebootFailed := false
+	if omniStatus.Ready {
+		var (
+			kubeconfigName    string
+			kubeconfigWritten bool
+			kubeconfigErr     error
+		)
+		if r.ArgoCDClusters {
+			kubeconfigName = clusterName + "-cluster-secret"
+			kubeconfigWritten, kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
+		} else {
+			kubeconfigName = clusterName + "-kubeconfig"
+			kubeconfigWritten, kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
+		}
+		if kubeconfigErr != nil {
+			return r.setFailure(ctx, cluster, statusBefore, "EnsureKubeconfigFailed", kubeconfigErr)
+		}
+		if kubeconfigWritten {
+			r.eventf(cluster, corev1.EventTypeNormal, "KubeconfigWritten",
+				"Kubeconfig written to %s/%s", r.KubeconfigNamespace, kubeconfigName)
+		}
+
+		// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
+		// GetDriftingMachines, which returns no candidates while any machine in the cluster is
+		// unhealthy — so a machine still rebooting from the previous cycle blocks further reboots.
+		if rebootCandidate != nil {
+			rebootFailed = r.rebootMachine(ctx, cluster, clusterName, rebootCandidate)
+			// Record the attempt time after issuing the reboot, regardless of
+			// outcome, so a failed RPC is not retried against the same machine
+			// every cycle. Stamping only here, right after the RPC actually ran,
+			// guarantees this is never persisted without a matching attempt.
+			if cluster.Status.LastRebootTimes == nil {
+				cluster.Status.LastRebootTimes = map[string]metav1.Time{}
+			}
+			cluster.Status.LastRebootTimes[rebootCandidate.MachineID] = now
+		}
+	}
+
 	if statusNeedsUpdate(statusBefore, &cluster.Status) {
 		if err := r.Status().Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
@@ -265,46 +274,109 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("Cluster not yet ready, requeuing", "phase", omniStatus.Phase)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
-
-	var (
-		kubeconfigName    string
-		kubeconfigWritten bool
-		kubeconfigErr     error
-	)
-	if r.ArgoCDClusters {
-		kubeconfigName = clusterName + "-cluster-secret"
-		kubeconfigWritten, kubeconfigErr = r.ensureArgoCDClusterSecret(ctx, clusterName)
-	} else {
-		kubeconfigName = clusterName + "-kubeconfig"
-		kubeconfigWritten, kubeconfigErr = r.ensureKubeconfigSecret(ctx, clusterName)
+	if rebootFailed {
+		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
-	if kubeconfigErr != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "EnsureKubeconfigFailed", kubeconfigErr)
-	}
-	if kubeconfigWritten {
-		r.eventf(cluster, corev1.EventTypeNormal, "KubeconfigWritten",
-			"Kubeconfig written to %s/%s", r.KubeconfigNamespace, kubeconfigName)
-	}
-
-	// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
-	// GetDriftingMachines, which returns no candidates while any machine in the cluster is
-	// unhealthy — so a machine still rebooting from the previous cycle blocks further reboots.
-	// The attempt was already recorded in status above, before the RPC.
 	if rebootCandidate != nil {
-		logger.Info("Config drift detected, triggering reboot", "machine", rebootCandidate.MachineID, "addr", rebootCandidate.ManagementAddress)
-		if err := r.OmniClient.RebootMachine(ctx, clusterName, rebootCandidate.ManagementAddress); err != nil {
-			logger.Error(err, "Failed to reboot machine", "machine", rebootCandidate.MachineID)
-			r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
-		} else {
-			machineRebootsTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
-			r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
-				"Rebooting machine %s to apply config update", rebootCandidate.MachineID)
-		}
 		return ctrl.Result{RequeueAfter: requeueLong}, nil
 	}
 
 	logger.Info("Cluster reconciled", "phase", omniStatus.Phase)
 	return ctrl.Result{RequeueAfter: requeueLong}, nil
+}
+
+// rebootMachine issues the reboot RPC for the selected drifting machine,
+// logging and emitting an Event for either outcome. It reports whether the
+// RPC failed; the caller is responsible for recording the attempt in status
+// regardless of the outcome.
+func (r *OmniClusterReconciler) rebootMachine(ctx context.Context, cluster *api.OmniCluster, clusterName string, candidate *MachineConfigDrift) (failed bool) {
+	logger := log.FromContext(ctx)
+	logger.Info("Config drift detected, triggering reboot", "machine", candidate.MachineID, "addr", candidate.ManagementAddress)
+	if err := r.OmniClient.RebootMachine(ctx, clusterName, candidate.ManagementAddress); err != nil {
+		logger.Error(err, "Failed to reboot machine", "machine", candidate.MachineID)
+		r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
+		return true
+	}
+
+	machineRebootsTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
+	r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
+		"Rebooting machine %s to apply config update", candidate.MachineID)
+	return false
+}
+
+// ensureCluster makes sure the cluster exists in Omni. On failure it records
+// the status failure itself and returns the ctrl.Result/error pair the caller
+// should return directly.
+func (r *OmniClusterReconciler) ensureCluster(
+	ctx context.Context,
+	cluster *api.OmniCluster,
+	statusBefore *api.OmniClusterStatus,
+	clusterName string,
+) (ctrl.Result, error) {
+	if err := r.OmniClient.EnsureCluster(ctx,
+		clusterName,
+		ownerOf(cluster),
+		cluster.Spec.KubernetesVersion,
+		cluster.Spec.TalosVersion,
+	); err != nil {
+		reason := "EnsureClusterFailed"
+		if goerrors.Is(err, ErrClusterOwnershipConflict) {
+			reason = "ClusterOwnershipConflict"
+		}
+		return r.setFailure(ctx, cluster, statusBefore, reason, err)
+	}
+	return ctrl.Result{}, nil
+}
+
+// allocateControlPlaneMachines ensures the control-plane machine set exists and
+// allocates machines to it, recording the result in allocatedMachines. On
+// failure it records the status failure itself and returns the ctrl.Result/error
+// pair the caller should return directly.
+func (r *OmniClusterReconciler) allocateControlPlaneMachines(
+	ctx context.Context,
+	cluster *api.OmniCluster,
+	statusBefore *api.OmniClusterStatus,
+	clusterName string,
+	allocatedMachines map[string][]string,
+) (ctrl.Result, error) {
+	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
+	if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, cpMachineSetID, omnires.LabelControlPlaneRole); err != nil {
+		return r.setFailure(ctx, cluster, statusBefore, "EnsureMachineSetFailed", err)
+	}
+
+	allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, cpMachineSetID,
+		omnires.LabelControlPlaneRole, cluster.Spec.ControlPlane)
+	if err != nil {
+		return r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
+	}
+	allocatedMachines[cpMachineSetID] = allocated
+	return ctrl.Result{}, nil
+}
+
+// allocateWorkerMachines ensures each declared worker machine set exists and
+// allocates machines to it, recording each result in allocatedMachines. On
+// failure it records the status failure itself and returns the ctrl.Result/error
+// pair the caller should return directly.
+func (r *OmniClusterReconciler) allocateWorkerMachines(
+	ctx context.Context,
+	cluster *api.OmniCluster,
+	statusBefore *api.OmniClusterStatus,
+	clusterName string,
+	allocatedMachines map[string][]string,
+) (ctrl.Result, error) {
+	for _, w := range cluster.Spec.Workers {
+		wID := fmt.Sprintf("%s-%s", clusterName, w.Name)
+		if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, wID, omnires.LabelWorkerRole); err != nil {
+			return r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
+		}
+		allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, wID,
+			omnires.LabelWorkerRole, w.MachineSetSpec)
+		if err != nil {
+			return r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
+		}
+		allocatedMachines[wID] = allocated
+	}
+	return ctrl.Result{}, nil
 }
 
 // reconcileMachineSet ensures the correct set of MachineSetNodes exist for one machine set.
@@ -604,7 +676,13 @@ func (r *OmniClusterReconciler) setFailure(ctx context.Context, cluster *api.Omn
 	if statusNeedsUpdate(statusBefore, &cluster.Status) {
 		_ = r.Status().Update(ctx, cluster)
 	}
-	return ctrl.Result{RequeueAfter: requeueShort}, err
+
+	// Returning err alongside RequeueAfter would make controller-runtime discard
+	// RequeueAfter and fall back to its exponential-backoff rate limiter instead
+	// (and log a warning about it); the failure is already fully recorded above
+	// via the Event and status condition, so return nil here to get the intended
+	// fixed retry cadence.
+	return ctrl.Result{RequeueAfter: requeueShort}, nil
 }
 
 // secretNeedsRefresh reports whether the kubeconfig Secret must be re-fetched

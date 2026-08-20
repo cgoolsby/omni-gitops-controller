@@ -111,16 +111,20 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// ── Reconcile Omni resources ──────────────────────────────────────────────
 	clusterName := cluster.Name
 
-	if result, err := r.ensureCluster(ctx, cluster, statusBefore, clusterName); err != nil {
-		return result, err
+	// These helpers record their own failure via setFailure (which returns a nil
+	// error so its RequeueAfter is honored), so they signal "stop and return"
+	// through an explicit bool rather than the error — err is nil on both the
+	// success and failure paths.
+	if result, stop := r.ensureCluster(ctx, cluster, statusBefore, clusterName); stop {
+		return result, nil
 	}
 
 	allocatedMachines := map[string][]string{}
-	if result, err := r.allocateControlPlaneMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); err != nil {
-		return result, err
+	if result, stop := r.allocateControlPlaneMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); stop {
+		return result, nil
 	}
-	if result, err := r.allocateWorkerMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); err != nil {
-		return result, err
+	if result, stop := r.allocateWorkerMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); stop {
+		return result, nil
 	}
 
 	// Prune machine sets that exist in Omni but are no longer declared in spec.
@@ -305,14 +309,14 @@ func (r *OmniClusterReconciler) rebootMachine(ctx context.Context, cluster *api.
 }
 
 // ensureCluster makes sure the cluster exists in Omni. On failure it records
-// the status failure itself and returns the ctrl.Result/error pair the caller
-// should return directly.
+// the status failure itself and returns (result, true) so the caller returns
+// that result directly; on success it returns (_, false) to continue.
 func (r *OmniClusterReconciler) ensureCluster(
 	ctx context.Context,
 	cluster *api.OmniCluster,
 	statusBefore *api.OmniClusterStatus,
 	clusterName string,
-) (ctrl.Result, error) {
+) (ctrl.Result, bool) {
 	if err := r.OmniClient.EnsureCluster(ctx,
 		clusterName,
 		ownerOf(cluster),
@@ -323,60 +327,65 @@ func (r *OmniClusterReconciler) ensureCluster(
 		if goerrors.Is(err, ErrClusterOwnershipConflict) {
 			reason = "ClusterOwnershipConflict"
 		}
-		return r.setFailure(ctx, cluster, statusBefore, reason, err)
+		result, _ := r.setFailure(ctx, cluster, statusBefore, reason, err)
+		return result, true
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, false
 }
 
 // allocateControlPlaneMachines ensures the control-plane machine set exists and
 // allocates machines to it, recording the result in allocatedMachines. On
-// failure it records the status failure itself and returns the ctrl.Result/error
-// pair the caller should return directly.
+// failure it records the status failure itself and returns (result, true) so the
+// caller returns that result directly; on success it returns (_, false).
 func (r *OmniClusterReconciler) allocateControlPlaneMachines(
 	ctx context.Context,
 	cluster *api.OmniCluster,
 	statusBefore *api.OmniClusterStatus,
 	clusterName string,
 	allocatedMachines map[string][]string,
-) (ctrl.Result, error) {
+) (ctrl.Result, bool) {
 	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
 	if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, cpMachineSetID, omnires.LabelControlPlaneRole); err != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "EnsureMachineSetFailed", err)
+		result, _ := r.setFailure(ctx, cluster, statusBefore, "EnsureMachineSetFailed", err)
+		return result, true
 	}
 
 	allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, cpMachineSetID,
 		omnires.LabelControlPlaneRole, cluster.Spec.ControlPlane)
 	if err != nil {
-		return r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
+		result, _ := r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
+		return result, true
 	}
 	allocatedMachines[cpMachineSetID] = allocated
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, false
 }
 
 // allocateWorkerMachines ensures each declared worker machine set exists and
 // allocates machines to it, recording each result in allocatedMachines. On
-// failure it records the status failure itself and returns the ctrl.Result/error
-// pair the caller should return directly.
+// failure it records the status failure itself and returns (result, true) so the
+// caller returns that result directly; on success it returns (_, false).
 func (r *OmniClusterReconciler) allocateWorkerMachines(
 	ctx context.Context,
 	cluster *api.OmniCluster,
 	statusBefore *api.OmniClusterStatus,
 	clusterName string,
 	allocatedMachines map[string][]string,
-) (ctrl.Result, error) {
+) (ctrl.Result, bool) {
 	for _, w := range cluster.Spec.Workers {
 		wID := fmt.Sprintf("%s-%s", clusterName, w.Name)
 		if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, wID, omnires.LabelWorkerRole); err != nil {
-			return r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
+			result, _ := r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
+			return result, true
 		}
 		allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, wID,
 			omnires.LabelWorkerRole, w.MachineSetSpec)
 		if err != nil {
-			return r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
+			result, _ := r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
+			return result, true
 		}
 		allocatedMachines[wID] = allocated
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, false
 }
 
 // reconcileMachineSet ensures the correct set of MachineSetNodes exist for one machine set.

@@ -2,3 +2,4 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - bases/omni.gitops.dev_omniclusters.yaml
+  - bases/omni.gitops.dev_machines.yaml

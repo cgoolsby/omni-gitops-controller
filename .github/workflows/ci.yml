@@ -11,9 +11,9 @@ jobs:
     name: Build & Vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -28,9 +28,9 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -42,9 +42,9 @@ jobs:
     name: CRD Drift Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -63,15 +63,15 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
           args: --timeout=5m

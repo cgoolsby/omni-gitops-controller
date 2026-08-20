@@ -18,7 +18,7 @@ var (
 )
 
 func addKnownTypes(s *runtime.Scheme) error {
-	s.AddKnownTypes(GroupVersion, &OmniCluster{}, &OmniClusterList{})
+	s.AddKnownTypes(GroupVersion, &OmniCluster{}, &OmniClusterList{}, &Machine{}, &MachineList{})
 	metav1.AddToGroupVersion(s, GroupVersion)
 	return nil
 }

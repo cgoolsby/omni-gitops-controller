@@ -10,6 +10,13 @@ rules:
   - apiGroups: ["omni.gitops.dev"]
     resources: ["omniclusters/status", "omniclusters/finalizers"]
     verbs: ["get", "update", "patch"]
+  # Machine CRD management
+  - apiGroups: ["omni.gitops.dev"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["omni.gitops.dev"]
+    resources: ["machines/status", "machines/finalizers"]
+    verbs: ["get", "update", "patch"]
   # Kubeconfig Secrets
   - apiGroups: [""]
     resources: ["secrets"]

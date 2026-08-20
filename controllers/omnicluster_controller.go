@@ -43,7 +43,12 @@ const (
 	kubeconfigRefreshInterval = 30 * 24 * time.Hour
 )
 
-// OmniClusterReconciler reconciles OmniCluster objects.
+// OmniClusterReconciler reconciles OmniCluster objects. It owns cluster- and
+// machine-set-scoped Omni state (Cluster + MachineSet existence, extensions /
+// schematic config, scale-up/down, cross-machine drift detection and
+// reboot-candidate selection) and expresses per-machine allocation by
+// creating/updating/deleting Machine objects, which the MachineReconciler
+// converges onto Omni. It never touches per-machine Omni state directly.
 type OmniClusterReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
@@ -119,11 +124,16 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return result, nil
 	}
 
+	// claimed accumulates every machine UUID already spoken for by a Machine
+	// object this cluster owns (across all sets), so a machine selected for one
+	// set earlier this reconcile is never re-selected for another before its
+	// Machine object is bound in Omni.
+	claimed := map[string]bool{}
 	allocatedMachines := map[string][]string{}
-	if result, stop := r.allocateControlPlaneMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); stop {
+	if result, stop := r.allocateControlPlaneMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines, claimed); stop {
 		return result, nil
 	}
-	if result, stop := r.allocateWorkerMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines); stop {
+	if result, stop := r.allocateWorkerMachines(ctx, cluster, statusBefore, clusterName, allocatedMachines, claimed); stop {
 		return result, nil
 	}
 
@@ -179,58 +189,20 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	clusterConfigDriftGauge.WithLabelValues(cluster.Name, cluster.Namespace).Set(boolToFloat64(len(drifting) > 0))
 
-	// Prune reboot bookkeeping for machines no longer allocated to this cluster.
-	allocatedSet := map[string]bool{}
-	for _, ids := range allocatedMachines {
-		for _, id := range ids {
-			allocatedSet[id] = true
-		}
-	}
-	for id := range cluster.Status.LastRebootTimes {
-		if !allocatedSet[id] {
-			delete(cluster.Status.LastRebootTimes, id)
+	// ── Signal drift-remediation reboots ──────────────────────────────────────
+	// The cluster controller owns cross-machine reboot-candidate selection (it
+	// needs cluster-wide visibility for the "one reboot in flight" invariant),
+	// but the reboot itself is owned by the Machine controller: here we only set
+	// Spec.RebootRequestedAt on the chosen Machine and let it do the RPC.
+	if omniStatus.Ready {
+		if err := r.signalDriftReboots(ctx, cluster, clusterName, drifting); err != nil {
+			return r.setFailure(ctx, cluster, statusBefore, "SignalRebootFailed", err)
 		}
 	}
 
-	now := metav1.Now()
-	var rebootCandidate *MachineConfigDrift
-	if len(drifting) == 0 {
-		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:               "ConfigDriftDetected",
-			Status:             metav1.ConditionFalse,
-			Reason:             "AllMachinesUpToDate",
-			Message:            "All machines are running the target config",
-			ObservedGeneration: cluster.Generation,
-		})
-	} else if rebootCandidate = selectRebootCandidate(drifting, cluster.Status.LastRebootTimes, now.Time); rebootCandidate != nil {
-		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:               "ConfigDriftDetected",
-			Status:             metav1.ConditionTrue,
-			Reason:             "PendingReboot",
-			Message:            fmt.Sprintf("Machine %s has pending config update; reboot scheduled", rebootCandidate.MachineID),
-			ObservedGeneration: cluster.Generation,
-		})
-	} else {
-		waiting := make([]string, 0, len(drifting))
-		for _, d := range drifting {
-			waiting = append(waiting, d.MachineID)
-		}
-		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type:               "ConfigDriftDetected",
-			Status:             metav1.ConditionTrue,
-			Reason:             "RebootCooldown",
-			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
-			ObservedGeneration: cluster.Generation,
-		})
-		r.eventf(cluster, corev1.EventTypeWarning, "RebootCooldown",
-			"Machine(s) %s still drifting after a recent reboot; waiting for the %s cooldown", strings.Join(waiting, ", "), rebootCooldown)
-	}
-
-	// Every Omni-side action this reconcile needs to perform (kubeconfig, reboot)
-	// runs here, before the single status write below, so that write always
-	// reflects this pass's fully settled outcome instead of a still-pending
-	// intent, and no later pass needs to discover an action was never taken.
-	rebootFailed := false
+	// Every Omni-side action this reconcile needs to perform (kubeconfig) runs
+	// here, before the single status write below, so that write always reflects
+	// this pass's fully settled outcome.
 	if omniStatus.Ready {
 		var (
 			kubeconfigName    string
@@ -251,21 +223,6 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			r.eventf(cluster, corev1.EventTypeNormal, "KubeconfigWritten",
 				"Kubeconfig written to %s/%s", r.KubeconfigNamespace, kubeconfigName)
 		}
-
-		// Reboot the selected drifting machine (rolling window = 1). The window is enforced by
-		// GetDriftingMachines, which returns no candidates while any machine in the cluster is
-		// unhealthy — so a machine still rebooting from the previous cycle blocks further reboots.
-		if rebootCandidate != nil {
-			rebootFailed = r.rebootMachine(ctx, cluster, clusterName, rebootCandidate)
-			// Record the attempt time after issuing the reboot, regardless of
-			// outcome, so a failed RPC is not retried against the same machine
-			// every cycle. Stamping only here, right after the RPC actually ran,
-			// guarantees this is never persisted without a matching attempt.
-			if cluster.Status.LastRebootTimes == nil {
-				cluster.Status.LastRebootTimes = map[string]metav1.Time{}
-			}
-			cluster.Status.LastRebootTimes[rebootCandidate.MachineID] = now
-		}
 	}
 
 	if statusNeedsUpdate(statusBefore, &cluster.Status) {
@@ -278,34 +235,87 @@ func (r *OmniClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		logger.Info("Cluster not yet ready, requeuing", "phase", omniStatus.Phase)
 		return ctrl.Result{RequeueAfter: requeueShort}, nil
 	}
-	if rebootFailed {
-		return ctrl.Result{RequeueAfter: requeueShort}, nil
-	}
-	if rebootCandidate != nil {
-		return ctrl.Result{RequeueAfter: requeueLong}, nil
-	}
 
 	logger.Info("Cluster reconciled", "phase", omniStatus.Phase)
 	return ctrl.Result{RequeueAfter: requeueLong}, nil
 }
 
-// rebootMachine issues the reboot RPC for the selected drifting machine,
-// logging and emitting an Event for either outcome. It reports whether the
-// RPC failed; the caller is responsible for recording the attempt in status
-// regardless of the outcome.
-func (r *OmniClusterReconciler) rebootMachine(ctx context.Context, cluster *api.OmniCluster, clusterName string, candidate *MachineConfigDrift) (failed bool) {
-	logger := log.FromContext(ctx)
-	logger.Info("Config drift detected, triggering reboot", "machine", candidate.MachineID, "addr", candidate.ManagementAddress)
-	if err := r.OmniClient.RebootMachine(ctx, clusterName, candidate.ManagementAddress); err != nil {
-		logger.Error(err, "Failed to reboot machine", "machine", candidate.MachineID)
-		r.eventf(cluster, corev1.EventTypeWarning, "RebootFailed", "%s", err.Error())
-		return true
+// signalDriftReboots picks at most one drifting machine cluster-wide to reboot
+// and requests it by setting Spec.RebootRequestedAt on that Machine. It enforces
+// the "one reboot in flight cluster-wide" invariant (skip if any machine already
+// has a reboot owed) and the per-machine cooldown (skip a machine rebooted
+// within rebootCooldown). GetDriftingMachines already returns nothing while any
+// machine in the cluster is unhealthy, so a machine still mid-reboot also blocks
+// new candidates. Sets the ConfigDriftDetected condition to match the outcome.
+func (r *OmniClusterReconciler) signalDriftReboots(ctx context.Context, cluster *api.OmniCluster, clusterName string, drifting []MachineConfigDrift) error {
+	if len(drifting) == 0 {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionFalse,
+			Reason:             "AllMachinesUpToDate",
+			Message:            "All machines are running the target config",
+			ObservedGeneration: cluster.Generation,
+		})
+		return nil
 	}
 
-	machineRebootsTotal.WithLabelValues(cluster.Name, cluster.Namespace).Inc()
-	r.eventf(cluster, corev1.EventTypeNormal, "RebootTriggered",
-		"Rebooting machine %s to apply config update", candidate.MachineID)
-	return false
+	machines, err := r.listClusterMachines(ctx, cluster.Namespace, clusterName)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]*api.Machine, len(machines))
+	for i := range machines {
+		byID[machines[i].Name] = &machines[i]
+	}
+
+	// A reboot already requested but not yet stamped (owed) is one in flight; do
+	// not request a second while it is pending.
+	if anyRebootInFlight(machines) {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionTrue,
+			Reason:             "PendingReboot",
+			Message:            "A drift-remediation reboot is already in flight",
+			ObservedGeneration: cluster.Generation,
+		})
+		return nil
+	}
+
+	now := metav1.Now()
+	candidate := selectDriftRebootCandidate(drifting, byID, now.Time)
+	if candidate == nil {
+		waiting := make([]string, 0, len(drifting))
+		for _, d := range drifting {
+			waiting = append(waiting, d.MachineID)
+		}
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               "ConfigDriftDetected",
+			Status:             metav1.ConditionTrue,
+			Reason:             "RebootCooldown",
+			Message:            fmt.Sprintf("Machine(s) %s still drifting after a recent reboot; next reboot allowed after a %s cooldown", strings.Join(waiting, ", "), rebootCooldown),
+			ObservedGeneration: cluster.Generation,
+		})
+		r.eventf(cluster, corev1.EventTypeWarning, "RebootCooldown",
+			"Machine(s) %s still drifting after a recent reboot; waiting for the %s cooldown", strings.Join(waiting, ", "), rebootCooldown)
+		return nil
+	}
+
+	m := byID[candidate.MachineID]
+	m.Spec.RebootRequestedAt = &now
+	m.Spec.ManagementAddress = candidate.ManagementAddress
+	if err := r.Update(ctx, m); err != nil {
+		return fmt.Errorf("request reboot for machine %s: %w", candidate.MachineID, err)
+	}
+	r.eventf(cluster, corev1.EventTypeNormal, "RebootRequested",
+		"Requested reboot of machine %s to apply config update", candidate.MachineID)
+	meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+		Type:               "ConfigDriftDetected",
+		Status:             metav1.ConditionTrue,
+		Reason:             "PendingReboot",
+		Message:            fmt.Sprintf("Machine %s has pending config update; reboot requested", candidate.MachineID),
+		ObservedGeneration: cluster.Generation,
+	})
+	return nil
 }
 
 // ensureCluster makes sure the cluster exists in Omni. On failure it records
@@ -343,6 +353,7 @@ func (r *OmniClusterReconciler) allocateControlPlaneMachines(
 	statusBefore *api.OmniClusterStatus,
 	clusterName string,
 	allocatedMachines map[string][]string,
+	claimed map[string]bool,
 ) (ctrl.Result, bool) {
 	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
 	if err := r.OmniClient.EnsureMachineSet(ctx, clusterName, cpMachineSetID, omnires.LabelControlPlaneRole); err != nil {
@@ -350,8 +361,8 @@ func (r *OmniClusterReconciler) allocateControlPlaneMachines(
 		return result, true
 	}
 
-	allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, cpMachineSetID,
-		omnires.LabelControlPlaneRole, cluster.Spec.ControlPlane)
+	allocated, err := r.reconcileMachineSetAllocation(ctx, cluster, clusterName, cpMachineSetID,
+		roleControlPlane, cluster.Spec.ControlPlane, claimed)
 	if err != nil {
 		result, _ := r.setFailure(ctx, cluster, statusBefore, "AllocateCPMachinesFailed", err)
 		return result, true
@@ -370,6 +381,7 @@ func (r *OmniClusterReconciler) allocateWorkerMachines(
 	statusBefore *api.OmniClusterStatus,
 	clusterName string,
 	allocatedMachines map[string][]string,
+	claimed map[string]bool,
 ) (ctrl.Result, bool) {
 	for _, w := range cluster.Spec.Workers {
 		wID := fmt.Sprintf("%s-%s", clusterName, w.Name)
@@ -377,8 +389,8 @@ func (r *OmniClusterReconciler) allocateWorkerMachines(
 			result, _ := r.setFailure(ctx, cluster, statusBefore, "EnsureWorkerMachineSetFailed", err)
 			return result, true
 		}
-		allocated, err := r.reconcileMachineSet(ctx, cluster, clusterName, wID,
-			omnires.LabelWorkerRole, w.MachineSetSpec)
+		allocated, err := r.reconcileMachineSetAllocation(ctx, cluster, clusterName, wID,
+			roleWorker, w.MachineSetSpec, claimed)
 		if err != nil {
 			result, _ := r.setFailure(ctx, cluster, statusBefore, "AllocateWorkerMachinesFailed", err)
 			return result, true
@@ -388,102 +400,128 @@ func (r *OmniClusterReconciler) allocateWorkerMachines(
 	return ctrl.Result{}, false
 }
 
-// reconcileMachineSet ensures the correct set of MachineSetNodes exist for one machine set.
-// It computes needed = desired - already_bound, selects that many available machines, and
-// creates MachineSetNodes + ConfigPatches for each new allocation.
-// Returns the full list of allocated machine UUIDs for this set.
-func (r *OmniClusterReconciler) reconcileMachineSet(
+// reconcileMachineSetAllocation converges the set of Machine objects for one
+// machine set onto spec.Replicas: it scales up by selecting available Omni
+// machines and creating Machine objects, scales down by deleting them (one at a
+// time for the control plane, to protect etcd quorum), keeps already-allocated
+// Machine specs in sync with the machine-set spec, and reconciles the
+// machine-set-scoped extensions configuration. It never touches per-machine Omni
+// state directly — the MachineReconciler converges each Machine onto Omni.
+// Returns the machine UUIDs currently allocated to (kept in) this set.
+func (r *OmniClusterReconciler) reconcileMachineSetAllocation(
 	ctx context.Context,
 	cluster *api.OmniCluster,
 	clusterName, machineSetID, role string,
 	spec api.MachineSetSpec,
+	claimed map[string]bool,
 ) ([]string, error) {
-	already, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+	existing, err := r.listMachineSetMachines(ctx, cluster.Namespace, clusterName, machineSetID)
 	if err != nil {
-		return nil, fmt.Errorf("list allocated nodes for %s: %w", machineSetID, err)
+		return nil, fmt.Errorf("list machines for %s: %w", machineSetID, err)
 	}
 
-	needed := int(spec.Replicas) - len(already)
-
-	if needed > 0 {
-		// ── Scale up ──────────────────────────────────────────────────────────
-		bound := make(map[string]bool, len(already))
-		for _, id := range already {
-			bound[id] = true
+	// Every machine that already has an object (even one mid-deletion) is
+	// claimed, so it is never re-selected for another set this reconcile.
+	var active []api.Machine
+	deleting := 0
+	for i := range existing {
+		claimed[existing[i].Name] = true
+		if existing[i].DeletionTimestamp.IsZero() {
+			active = append(active, existing[i])
+		} else {
+			deleting++
 		}
+	}
 
-		candidates, err := r.OmniClient.SelectAvailableMachines(ctx, spec.MachineSelector, needed+len(already))
+	desired := int(spec.Replicas)
+	current := len(active)
+
+	switch {
+	case current < desired:
+		// ── Scale up ──────────────────────────────────────────────────────────
+		needed := desired - current
+		candidates, err := r.OmniClient.SelectAvailableMachines(ctx, spec.MachineSelector, needed+len(claimed))
 		if err != nil {
 			return nil, fmt.Errorf("select machines for %s: %w", machineSetID, err)
 		}
 
 		var fresh []string
 		for _, id := range candidates {
-			if !bound[id] {
-				fresh = append(fresh, id)
-				if len(fresh) >= needed {
-					break
-				}
+			if claimed[id] {
+				continue
+			}
+			fresh = append(fresh, id)
+			if len(fresh) >= needed {
+				break
 			}
 		}
-
 		if len(fresh) < needed {
 			return nil, fmt.Errorf("not enough available machines for %s: need %d more, found %d candidates",
 				machineSetID, needed, len(fresh))
 		}
 
 		for _, machineID := range fresh {
-			if err := r.OmniClient.EnsureMachineSetNode(ctx, clusterName, machineSetID, machineID, role); err != nil {
-				return nil, fmt.Errorf("bind machine %s to %s: %w", machineID, machineSetID, err)
+			if err := r.createMachine(ctx, cluster, clusterName, machineSetID, role, machineID, spec); err != nil {
+				return nil, fmt.Errorf("create machine %s for %s: %w", machineID, machineSetID, err)
 			}
-			already = append(already, machineID)
+			claimed[machineID] = true
+			active = append(active, api.Machine{ObjectMeta: metav1.ObjectMeta{Name: machineID}})
 		}
 		r.eventf(cluster, corev1.EventTypeNormal, "MachinesAllocated",
 			"Allocated %d machine(s) to %s", len(fresh), machineSetID)
 
-	} else if needed < 0 {
+	case current > desired:
 		// ── Scale down ────────────────────────────────────────────────────────
-		toRemove := -needed
+		toRemove := current - desired
 
-		if role == omnires.LabelControlPlaneRole {
-			if int(spec.Replicas) < 1 {
+		if role == roleControlPlane {
+			if desired < 1 {
 				return nil, fmt.Errorf("control plane cannot scale below 1 replica")
 			}
-			if int(spec.Replicas)%2 == 0 {
+			if desired%2 == 0 {
 				log.FromContext(ctx).Info("WARNING: even number of control-plane replicas loses etcd quorum margin",
-					"replicas", spec.Replicas)
+					"replicas", desired)
 			}
-			// Remove at most one control-plane member per reconcile. Evicting
-			// several etcd members at once (e.g. scaling 5 → 3) risks quorum
-			// loss while Omni is still tearing down the first member. The
-			// periodic RequeueAfter picks up the next removal on a later
-			// cycle, and DeleteMachineSetNode errors while teardown is in
-			// progress, so each member is fully removed before the next one.
-			if toRemove > 1 {
+			// Remove at most one control-plane member per reconcile, and never
+			// start a new removal while one is still tearing down: evicting
+			// several etcd members at once risks quorum loss. The periodic
+			// RequeueAfter and the .Owns watch pick up the next removal once the
+			// prior Machine's finalizer has released it.
+			switch {
+			case deleting > 0:
+				toRemove = 0
+			case toRemove > 1:
 				toRemove = 1
 			}
 		}
 
-		evict := already[len(already)-toRemove:]
-		keep := already[:len(already)-toRemove]
-
-		for _, machineID := range evict {
-			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
-				return nil, fmt.Errorf("evict machine %s from %s: %w", machineID, machineSetID, err)
+		if toRemove > 0 {
+			evict := active[len(active)-toRemove:]
+			active = active[:len(active)-toRemove]
+			for i := range evict {
+				if err := r.deleteMachine(ctx, &evict[i]); err != nil {
+					return nil, fmt.Errorf("evict machine %s from %s: %w", evict[i].Name, machineSetID, err)
+				}
 			}
-		}
-		already = keep
-	}
-
-	// Apply patches to all machines on every reconcile so updates propagate to existing clusters.
-	for _, machineID := range already {
-		if err := r.applyConfigPatches(ctx, clusterName, machineSetID, machineID, spec.ConfigPatches); err != nil {
-			return nil, fmt.Errorf("config patches for %s: %w", machineID, err)
+			r.eventf(cluster, corev1.EventTypeNormal, "MachinesReleased",
+				"Released %d machine(s) from %s", len(evict), machineSetID)
 		}
 	}
 
-	// Reconcile extensions configuration at machine-set level.
-	// Delete the resource when the extensions list is cleared so Omni revokes the schematic.
+	// Keep already-allocated Machine specs in sync with the machine-set spec so
+	// config-patch / kernel-arg / role changes propagate to existing machines.
+	// Freshly-created machines (zero ResourceVersion) already carry the spec.
+	for i := range active {
+		if active[i].ResourceVersion == "" {
+			continue
+		}
+		if err := r.syncMachineSpec(ctx, &active[i], clusterName, machineSetID, role, spec); err != nil {
+			return nil, fmt.Errorf("sync machine %s spec: %w", active[i].Name, err)
+		}
+	}
+
+	// Reconcile extensions configuration at machine-set level (stays cluster-
+	// scoped in Omni). Delete the resource when the list is cleared.
 	if len(spec.MachineExtensions) > 0 {
 		if err := r.OmniClient.EnsureMachineSetExtensionsConfiguration(ctx, clusterName, machineSetID, spec.MachineExtensions); err != nil {
 			return nil, fmt.Errorf("extensions configuration for %s: %w", machineSetID, err)
@@ -494,46 +532,78 @@ func (r *OmniClusterReconciler) reconcileMachineSet(
 		}
 	}
 
-	// Reconcile kernel args per-machine (schematic-level, active during maintenance/install boot).
-	// Delete the resource when the kernelArgs list is cleared so the args are revoked.
-	for _, machineID := range already {
-		if len(spec.KernelArgs) > 0 {
-			if err := r.OmniClient.EnsureMachineKernelArgs(ctx, machineID, spec.KernelArgs); err != nil {
-				return nil, fmt.Errorf("kernel args for machine %s: %w", machineID, err)
-			}
-		} else {
-			if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-				return nil, fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
-			}
-		}
+	allocated := make([]string, 0, len(active))
+	for i := range active {
+		allocated = append(allocated, active[i].Name)
 	}
-
-	return already, nil
+	return allocated, nil
 }
 
-// releaseMachine unbinds a machine from its machine set and removes its
-// ConfigPatches and KernelArgs, so the machine returns to the available pool
-// without carrying stale customisation into the next cluster that allocates
-// it. DeleteMachineSetNode returns an error while Omni teardown is in
-// progress, which makes the caller requeue and retry.
-func (r *OmniClusterReconciler) releaseMachine(ctx context.Context, clusterName, machineID string) error {
-	if err := r.OmniClient.DeleteMachineSetNode(ctx, machineID); err != nil {
-		return fmt.Errorf("delete machine set node %s: %w", machineID, err)
+// createMachine creates a Machine object for a freshly-allocated machine, owned
+// (controller reference) by the cluster so it is garbage-collected on cluster
+// delete and its state changes enqueue the owner via the .Owns watch.
+func (r *OmniClusterReconciler) createMachine(
+	ctx context.Context,
+	cluster *api.OmniCluster,
+	clusterName, machineSetID, role, machineID string,
+	spec api.MachineSetSpec,
+) error {
+	m := &api.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      machineID,
+			Namespace: cluster.Namespace,
+			Labels: map[string]string{
+				labelCluster:    clusterName,
+				labelMachineSet: machineSetID,
+			},
+		},
+		Spec: desiredMachineSpec(clusterName, machineSetID, role, spec),
 	}
-	if err := r.OmniClient.DeleteConfigPatchesForMachine(ctx, clusterName, machineID); err != nil {
-		return fmt.Errorf("delete config patches for machine %s: %w", machineID, err)
+	if err := controllerutil.SetControllerReference(cluster, m, r.Scheme); err != nil {
+		return fmt.Errorf("set controller reference: %w", err)
 	}
-	if err := r.OmniClient.DeleteKernelArgsForMachine(ctx, machineID); err != nil {
-		return fmt.Errorf("delete kernel args for machine %s: %w", machineID, err)
+	if err := r.Create(ctx, m); err != nil && !errors.IsAlreadyExists(err) {
+		return err
 	}
 	return nil
 }
 
-// pruneOrphanedMachineSets deletes Omni MachineSets labelled with this cluster
+// syncMachineSpec updates an existing Machine's spec to match the machine-set
+// spec, preserving the reboot-signaling fields (RebootRequestedAt,
+// ManagementAddress) which are owned by the drift-reboot path, not by the set.
+func (r *OmniClusterReconciler) syncMachineSpec(
+	ctx context.Context,
+	machine *api.Machine,
+	clusterName, machineSetID, role string,
+	spec api.MachineSetSpec,
+) error {
+	updated := machine.DeepCopy()
+	want := desiredMachineSpec(clusterName, machineSetID, role, spec)
+	updated.Spec.ClusterName = want.ClusterName
+	updated.Spec.MachineSetID = want.MachineSetID
+	updated.Spec.Role = want.Role
+	updated.Spec.ConfigPatches = want.ConfigPatches
+	updated.Spec.KernelArgs = want.KernelArgs
+	if updated.Labels == nil {
+		updated.Labels = map[string]string{}
+	}
+	updated.Labels[labelCluster] = clusterName
+	updated.Labels[labelMachineSet] = machineSetID
+
+	if equality.Semantic.DeepEqual(machine.Spec, updated.Spec) &&
+		equality.Semantic.DeepEqual(machine.Labels, updated.Labels) {
+		return nil
+	}
+	return r.Update(ctx, updated)
+}
+
+// pruneOrphanedMachineSets tears down Omni MachineSets labelled with this cluster
 // that are no longer declared in spec — e.g. when a user removes a worker set
-// from spec.workers without deleting the whole OmniCluster. Like
-// deleteOmniResources, discovery is driven by Omni state (the authoritative
-// source) rather than status.AllocatedMachines, which can be empty or stale.
+// from spec.workers without deleting the whole OmniCluster. It deletes the
+// Machine objects for each orphaned set (letting their finalizers unwind the
+// per-machine Omni state) and, once they are gone, deletes the machine-set-scoped
+// Omni resources. Discovery is driven by Omni state (the authoritative source)
+// rather than status.AllocatedMachines, which can be empty or stale.
 func (r *OmniClusterReconciler) pruneOrphanedMachineSets(ctx context.Context, cluster *api.OmniCluster, clusterName string) error {
 	cpMachineSetID := omnires.ControlPlanesResourceID(clusterName)
 	desired := map[string]bool{cpMachineSetID: true}
@@ -556,12 +626,25 @@ func (r *OmniClusterReconciler) pruneOrphanedMachineSets(ctx context.Context, cl
 			continue
 		}
 
-		machines, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+		// Delete the Machine objects for this set and wait (via requeue + the
+		// .Owns watch) for their finalizers to unwind per-machine Omni state
+		// before removing the machine-set-scoped resources.
+		remaining, err := r.deleteMachineSetMachines(ctx, cluster, clusterName, machineSetID)
+		if err != nil {
+			return err
+		}
+		if remaining > 0 {
+			return fmt.Errorf("waiting for %d machine(s) in orphaned set %s to finish teardown", remaining, machineSetID)
+		}
+
+		// Backstop: release any Omni MachineSetNodes not fronted by a Machine
+		// object (e.g. leaked or created out-of-band), so the set can be removed.
+		nodes, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
 		if err != nil {
 			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
 		}
-		for _, machineID := range machines {
-			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+		for _, machineID := range nodes {
+			if err := releaseMachineOmni(ctx, r.OmniClient, clusterName, machineID); err != nil {
 				return fmt.Errorf("release machine from orphaned set %s: %w", machineSetID, err)
 			}
 		}
@@ -575,32 +658,13 @@ func (r *OmniClusterReconciler) pruneOrphanedMachineSets(ctx context.Context, cl
 	return nil
 }
 
-// applyConfigPatches creates or updates Omni ConfigPatches for a machine,
-// then deletes any patches that are no longer in the desired set.
-func (r *OmniClusterReconciler) applyConfigPatches(
-	ctx context.Context,
-	clusterName, machineSetID, machineID string,
-	patches []api.ConfigPatch,
-) error {
-	keepIDs := make(map[string]struct{}, len(patches))
-	for _, p := range patches {
-		patchID := fmt.Sprintf("%s-%s-%s", clusterName, machineID, p.Name)
-		keepIDs[patchID] = struct{}{}
-		if err := r.OmniClient.EnsureConfigPatch(ctx, patchID, clusterName, machineSetID, machineID, json.RawMessage(p.Inline.Raw)); err != nil {
-			return fmt.Errorf("ensure patch %q: %w", p.Name, err)
-		}
-	}
-	if err := r.OmniClient.PruneOrphanedConfigPatches(ctx, clusterName, machineID, keepIDs); err != nil {
-		return fmt.Errorf("prune patches for machine %s: %w", machineID, err)
-	}
-	return nil
-}
-
-// deleteOmniResources tears down all Omni resources for this cluster in reverse
-// order. Teardown is driven entirely by Omni state (the authoritative source)
-// rather than status.AllocatedMachines, which can be empty or stale — e.g. when
-// the CR is deleted before its first successful reconcile or after a partially
-// failed one. status.AllocatedMachines remains informational only.
+// deleteOmniResources tears down all resources for this cluster on delete. It
+// first deletes the Machine objects (whose finalizers unwind per-machine Omni
+// state) and waits for them to be gone, then removes the machine-set-scoped and
+// cluster-scoped Omni resources. Discovery of the latter is driven by Omni state
+// (the authoritative source) rather than status.AllocatedMachines, which can be
+// empty or stale — e.g. when the CR is deleted before its first successful
+// reconcile or after a partially failed one.
 func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster *api.OmniCluster) error {
 	clusterName := cluster.Name
 
@@ -627,23 +691,37 @@ func (r *OmniClusterReconciler) deleteOmniResources(ctx context.Context, cluster
 		}
 	}
 
+	// Delete every Machine object this cluster owns and wait for their finalizers
+	// to unwind per-machine Omni state (unbind, config patches, kernel args)
+	// before tearing down the Omni-side machine sets/cluster.
+	machines, err := r.listClusterMachines(ctx, cluster.Namespace, clusterName)
+	if err != nil {
+		return fmt.Errorf("list machines for cluster %s: %w", clusterName, err)
+	}
+	for i := range machines {
+		if err := r.deleteMachine(ctx, &machines[i]); err != nil {
+			return fmt.Errorf("delete machine %s: %w", machines[i].Name, err)
+		}
+	}
+	if len(machines) > 0 {
+		return fmt.Errorf("waiting for %d machine(s) to finish teardown", len(machines))
+	}
+
 	machineSetIDs, err := r.OmniClient.ListMachineSetIDsForCluster(ctx, clusterName)
 	if err != nil {
 		return fmt.Errorf("list machine sets for cluster %s: %w", clusterName, err)
 	}
 
-	// Remove all MachineSetNodes first (machines release back to available
-	// pool), along with each machine's ConfigPatches and KernelArgs so the
-	// machine doesn't carry stale customisation into the next cluster that
-	// allocates it. DeleteMachineSetNode returns an error while teardown is in
-	// progress, which makes controller-runtime requeue and retry.
+	// Backstop: release any MachineSetNodes not fronted by a Machine object
+	// (leaked or created out-of-band). In normal operation the Machine
+	// finalizers above have already unbound every node.
 	for _, machineSetID := range machineSetIDs {
-		machines, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+		nodes, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
 		if err != nil {
 			return fmt.Errorf("list machine set nodes for %s: %w", machineSetID, err)
 		}
-		for _, machineID := range machines {
-			if err := r.releaseMachine(ctx, clusterName, machineID); err != nil {
+		for _, machineID := range nodes {
+			if err := releaseMachineOmni(ctx, r.OmniClient, clusterName, machineID); err != nil {
 				return err
 			}
 		}
@@ -839,7 +917,59 @@ func (r *OmniClusterReconciler) ensureArgoCDClusterSecret(ctx context.Context, c
 func (r *OmniClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&api.OmniCluster{}).
+		Owns(&api.Machine{}).
 		Complete(r)
+}
+
+// ── Machine object helpers ──────────────────────────────────────────────────
+
+// listClusterMachines returns all Machine objects owned by this cluster (across
+// all machine sets), found by the cluster label instead of a bookkeeping map.
+func (r *OmniClusterReconciler) listClusterMachines(ctx context.Context, namespace, clusterName string) ([]api.Machine, error) {
+	list := &api.MachineList{}
+	if err := r.List(ctx, list,
+		client.InNamespace(namespace),
+		client.MatchingLabels{labelCluster: clusterName},
+	); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+// listMachineSetMachines returns the Machine objects allocated to one set.
+func (r *OmniClusterReconciler) listMachineSetMachines(ctx context.Context, namespace, clusterName, machineSetID string) ([]api.Machine, error) {
+	list := &api.MachineList{}
+	if err := r.List(ctx, list,
+		client.InNamespace(namespace),
+		client.MatchingLabels{labelCluster: clusterName, labelMachineSet: machineSetID},
+	); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+// deleteMachine deletes a Machine object, tolerating one already gone or already
+// being deleted.
+func (r *OmniClusterReconciler) deleteMachine(ctx context.Context, machine *api.Machine) error {
+	if !machine.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, machine))
+}
+
+// deleteMachineSetMachines deletes every Machine object in a set and returns how
+// many still exist (including any still tearing down via their finalizer).
+func (r *OmniClusterReconciler) deleteMachineSetMachines(ctx context.Context, cluster *api.OmniCluster, clusterName, machineSetID string) (int, error) {
+	machines, err := r.listMachineSetMachines(ctx, cluster.Namespace, clusterName, machineSetID)
+	if err != nil {
+		return 0, fmt.Errorf("list machines for %s: %w", machineSetID, err)
+	}
+	for i := range machines {
+		if err := r.deleteMachine(ctx, &machines[i]); err != nil {
+			return 0, fmt.Errorf("delete machine %s: %w", machines[i].Name, err)
+		}
+	}
+	return len(machines), nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -850,13 +980,41 @@ func ownerOf(cluster *api.OmniCluster) string {
 	return cluster.Namespace + "/" + cluster.Name
 }
 
-// selectRebootCandidate returns the first drifting machine whose last
-// drift-remediation reboot is absent or older than rebootCooldown, or nil if
-// every drifting machine is still cooling down.
-func selectRebootCandidate(drifting []MachineConfigDrift, lastReboots map[string]metav1.Time, now time.Time) *MachineConfigDrift {
+// desiredMachineSpec builds the machine-set-derived portion of a Machine spec.
+// It deliberately leaves RebootRequestedAt/ManagementAddress zero: those are
+// owned by the drift-reboot signaling path, not by the machine set.
+func desiredMachineSpec(clusterName, machineSetID, role string, spec api.MachineSetSpec) api.MachineSpec {
+	return api.MachineSpec{
+		ClusterName:   clusterName,
+		MachineSetID:  machineSetID,
+		Role:          role,
+		ConfigPatches: spec.ConfigPatches,
+		KernelArgs:    spec.KernelArgs,
+	}
+}
+
+// anyRebootInFlight reports whether any machine has a reboot owed (requested but
+// not yet stamped), i.e. a drift-remediation reboot is already in flight.
+func anyRebootInFlight(machines []api.Machine) bool {
+	for i := range machines {
+		if rebootOwed(machines[i].Spec, machines[i].Status) {
+			return true
+		}
+	}
+	return false
+}
+
+// selectDriftRebootCandidate returns the first drifting machine whose backing
+// Machine object's last reboot is absent or older than rebootCooldown, or nil if
+// every drifting machine is still cooling down (or has no Machine object).
+func selectDriftRebootCandidate(drifting []MachineConfigDrift, byID map[string]*api.Machine, now time.Time) *MachineConfigDrift {
 	for i := range drifting {
-		last, ok := lastReboots[drifting[i].MachineID]
-		if !ok || now.Sub(last.Time) >= rebootCooldown {
+		m := byID[drifting[i].MachineID]
+		if m == nil {
+			continue
+		}
+		last := m.Status.LastRebootTime
+		if last == nil || now.Sub(last.Time) >= rebootCooldown {
 			return &drifting[i]
 		}
 	}

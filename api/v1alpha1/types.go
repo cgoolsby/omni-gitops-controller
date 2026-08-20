@@ -82,15 +82,11 @@ type OmniClusterStatus struct {
 	Phase string `json:"phase,omitempty"`
 	// Ready is true when the Omni cluster is Running and the Kubernetes API is reachable.
 	Ready bool `json:"ready,omitempty"`
-	// AllocatedMachines records the Omni machine UUIDs bound to this cluster,
-	// keyed by machine-set ID. Used to detect drift on re-reconcile.
+	// AllocatedMachines records the Omni machine UUIDs allocated to this cluster,
+	// keyed by machine-set ID. It is derived from the Machine objects the
+	// controller owns, and is informational only.
 	// +optional
 	AllocatedMachines map[string][]string `json:"allocatedMachines,omitempty"`
-	// LastRebootTimes records when the controller last issued a drift-remediation
-	// reboot for each machine (keyed by machine UUID). Used to enforce a cooldown
-	// so a persistently-drifting machine is not rebooted in a loop.
-	// +optional
-	LastRebootTimes map[string]metav1.Time `json:"lastRebootTimes,omitempty"`
 	// FailureReason is a short machine-readable token when phase is Failed.
 	// +optional
 	FailureReason *string `json:"failureReason,omitempty"`

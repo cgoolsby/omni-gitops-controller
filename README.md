@@ -55,9 +55,38 @@ pointing at that secret — no manual steps, no out-of-band credential distribut
 ```
 
 The controller runs entirely on the management cluster. It holds no state of its own —
-all cluster state lives in Omni (authoritative) and in the `OmniCluster` status subresource.
-Deletion is handled via a finalizer: the controller tears down Omni resources in dependency
-order (MachineSetNodes → MachineSets → Cluster) before the CR is removed, preventing orphaned
+all cluster state lives in Omni (authoritative), in the `OmniCluster`/`Machine` custom
+resources, and in their status subresources.
+
+Per-machine Omni state is owned by a first-class, namespaced **`Machine`** CRD and its own
+`MachineReconciler`. `OmniClusterReconciler` is an orchestrator: it decides which machines a
+cluster needs and expresses that by creating/updating/deleting `Machine` objects — the same
+shape as Deployment → ReplicaSet → Pod, or Cluster API's Cluster → MachineSet → Machine. Each
+`Machine`'s `metadata.name` is the raw Omni machine UUID, and every `Machine` is owned
+(controller reference) by its `OmniCluster`, so a machine's state change enqueues its owner via
+`.Owns(&Machine{})` — no polling — and machines are garbage-collected on cluster delete.
+
+### Controller responsibilities
+
+| Concern | Owner |
+|---|---|
+| Cluster / MachineSet existence in Omni | `OmniClusterReconciler` |
+| Extensions / schematic config (machine-set scoped in Omni) | `OmniClusterReconciler` |
+| Which machines are allocated to a set; scale-up/down; quorum-safe one-at-a-time control-plane scale-down | `OmniClusterReconciler` — expressed as create/update/delete of `Machine` objects; "already allocated" is a labelled `List` (`omni.gitops.dev/cluster`, `omni.gitops.dev/machine-set`) |
+| Keeping already-allocated `Machine` specs in sync when the machine-set spec changes | `OmniClusterReconciler` |
+| Cross-machine drift detection + reboot-candidate selection ("skip if any machine unhealthy", one reboot in flight cluster-wide, per-machine cooldown) | `OmniClusterReconciler` — sets `Machine.Spec.RebootRequestedAt` on the chosen candidate |
+| Bind/unbind a machine to its set in Omni | `MachineReconciler` |
+| Config patches + kernel args for one machine | `MachineReconciler` |
+| Issuing the reboot RPC and recording the outcome | `MachineReconciler` — `Status.LastRebootTime` is stamped only *after* the RPC returns |
+| Per-machine teardown on release/delete (unbind → config patches → kernel args) | `MachineReconciler` — via the `machine.omni.gitops.dev/finalizer` |
+
+A reboot is "owed" iff `Machine.Spec.RebootRequestedAt` is newer than `Status.LastRebootTime`;
+stamping `LastRebootTime` after the RPC naturally makes it no longer owed, so no field-clearing
+handshake is needed.
+
+Deletion is handled via finalizers: the cluster controller deletes its `Machine` objects and
+waits (via the `.Owns` watch) for each finalizer to unwind its per-machine Omni state before
+tearing down the machine-set-scoped and cluster-scoped Omni resources, preventing orphaned
 machines in Omni.
 
 ---
@@ -225,8 +254,7 @@ Flux can immediately target the cluster using a `Kustomization` with
 | `status.observedGeneration` | `int64` | The `.metadata.generation` last processed by the controller. Set on both success and failure paths; conditions carry the success/failure signal. |
 | `status.phase` | `string` | Mirrors the Omni ClusterStatus phase: `ScalingUp`, `Running`, `ScalingDown`, `Destroying`, `Failed`. |
 | `status.ready` | `bool` | `true` when Omni reports the cluster as `Running` and the Kubernetes API is reachable. |
-| `status.allocatedMachines` | `map[string][]string` | Machine UUIDs bound to this cluster, keyed by MachineSet ID. Used to detect drift on re-reconcile. |
-| `status.lastRebootTimes` | `map[string]Time` | When the controller last issued a drift-remediation reboot for each machine, keyed by machine UUID. Enforces the reboot cooldown (see [Config Drift Detection](#config-drift-detection)). |
+| `status.allocatedMachines` | `map[string][]string` | Machine UUIDs allocated to this cluster, keyed by MachineSet ID. Derived from the owned `Machine` objects; informational. |
 | `status.failureReason` | `string` | Short machine-readable token when `phase` is `Failed`, e.g. `EnsureClusterFailed`. |
 | `status.failureMessage` | `string` | Human-readable error description when `phase` is `Failed`. |
 | `status.conditions[Ready]` | `metav1.Condition` | `True` when Omni reports the cluster `Running` and the Kubernetes API is reachable. The reason mirrors the Omni phase (e.g. `Running`, `ScalingUp`), or is a failure reason (e.g. `EnsureClusterFailed`) when reconcile fails. |
@@ -401,9 +429,9 @@ Config changes declared in Git propagate to running machines automatically. When
 `configPatches` (or other config-level spec fields) on an `OmniCluster`, the controller pushes
 the new desired config to Omni, and each machine's running config falls behind — Omni reports
 `ConfigUpToDate: false` for that machine. Applying the new config to a Talos machine requires a
-reboot, which the controller performs one machine at a time.
+reboot, which is performed one machine at a time.
 
-**Detection.** On every reconcile of a Ready cluster, the controller lists Omni's
+**Detection.** On every reconcile of a Ready cluster, the `OmniClusterReconciler` lists Omni's
 `ClusterMachineStatus` resources for the cluster and collects machines whose config is out of
 date (and that have no config error — a machine with a `LastConfigError` is never rebooted,
 since rebooting won't fix a bad config).
@@ -414,18 +442,26 @@ back from a previous drift-correction reboot — no reboot candidates are offere
 This is what enforces "at most one machine down at a time": the next reboot is not issued until
 the previous machine has fully rejoined. In an HA control plane this preserves etcd quorum.
 
-**Reboot cooldown.** Each machine's last reboot attempt is recorded in
-`status.lastRebootTimes` (keyed by machine ID, written before the reboot RPC so a failed RPC
-doesn't cause hammering). A machine is not rebooted again within **10 minutes** of its last
-attempt. If a machine is still drifting inside that window — for example, the config genuinely
-requires more than a reboot — the controller surfaces it via the `RebootCooldown` condition and
-a Warning event instead of reboot-looping it.
+**Signal, then act.** The cluster controller selects at most one candidate cluster-wide and
+signals the reboot by setting `RebootRequestedAt` on that `Machine`'s spec — it does not call
+the reboot RPC itself. The `MachineReconciler` sees the request (a reboot is "owed" iff
+`Spec.RebootRequestedAt` is newer than `Status.LastRebootTime`), issues the reboot RPC, and
+stamps `Machine.Status.LastRebootTime` **only after the RPC returns** — so the stamp is never
+persisted without a matching attempt, and stamping it makes the reboot naturally no longer owed
+(no field-clearing handshake). A reboot already requested but not yet stamped counts as "in
+flight" and suppresses a second request cluster-wide.
 
-**Conditions.** Drift state is reported on the `ConfigDriftDetected` condition:
+**Reboot cooldown.** The cluster controller reads each `Machine`'s `Status.LastRebootTime` and
+will not request another reboot for that machine within **10 minutes** of its last attempt. If
+a machine is still drifting inside that window — for example, the config genuinely requires more
+than a reboot — the controller surfaces it via the `RebootCooldown` condition and a Warning
+event instead of reboot-looping it.
+
+**Conditions.** Drift state is reported on the `OmniCluster`'s `ConfigDriftDetected` condition:
 
 | Status | Reason | Meaning |
 |--------|--------|---------|
-| `True` | `PendingReboot` | A drifting machine was found and a reboot is being issued. |
+| `True` | `PendingReboot` | A drifting machine was found and a reboot has been requested / is in flight. |
 | `True` | `RebootCooldown` | Drifting machine(s) were rebooted recently and are waiting out the cooldown. |
 | `False` | `AllMachinesUpToDate` | All machines are running the target config. |
 
@@ -437,13 +473,13 @@ kubectl describe omnicluster my-cluster -n omni-gitops-system
 kubectl get omnicluster my-cluster -n omni-gitops-system \
   -o jsonpath='{.status.conditions}'
 
-# Last drift-remediation reboot attempt per machine
-kubectl get omnicluster my-cluster -n omni-gitops-system \
-  -o jsonpath='{.status.lastRebootTimes}'
+# Per-machine state, including the last drift-remediation reboot
+kubectl get machines.omni.gitops.dev -n omni-gitops-system \
+  -l omni.gitops.dev/cluster=my-cluster
 ```
 
-Reboots also emit `RebootTriggered` / `RebootFailed` / `RebootCooldown` events on the
-`OmniCluster`.
+The cluster controller emits a `RebootRequested` / `RebootCooldown` event on the `OmniCluster`,
+and the `MachineReconciler` emits `RebootTriggered` / `RebootFailed` events on the `Machine`.
 
 **Limitations:**
 

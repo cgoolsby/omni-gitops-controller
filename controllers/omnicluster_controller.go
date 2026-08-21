@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -420,6 +421,42 @@ func (r *OmniClusterReconciler) reconcileMachineSetAllocation(
 		return nil, fmt.Errorf("list machines for %s: %w", machineSetID, err)
 	}
 
+	// ── Adopt pre-existing Omni bindings ────────────────────────────────────────
+	// Allocation is Omni-authoritative: a machine already bound to this set in
+	// Omni but lacking a Machine object (e.g. a cluster created before the Machine
+	// CRD existed) must be adopted, not treated as absent. Without this the
+	// "already allocated" baseline would read as 0 and we would scale up a *second*
+	// machine on top of the live one — the v0.3.0/v0.3.1 double-bind regression.
+	bound, err := r.OmniClient.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		return nil, fmt.Errorf("list omni bindings for %s: %w", machineSetID, err)
+	}
+	haveObject := make(map[string]bool, len(existing))
+	for i := range existing {
+		haveObject[existing[i].Name] = true
+	}
+	for _, machineID := range bound {
+		if haveObject[machineID] {
+			continue
+		}
+		// createMachine fronts the existing MachineSetNode with a Machine carrying
+		// the same owner ref and labels. It does NOT create a second binding: the
+		// MachineReconciler's EnsureMachineSetNode is idempotent for a UUID already
+		// bound to this set.
+		if err := r.createMachine(ctx, cluster, clusterName, machineSetID, role, machineID, spec); err != nil {
+			return nil, fmt.Errorf("adopt machine %s into %s: %w", machineID, machineSetID, err)
+		}
+		haveObject[machineID] = true
+		// Append a synthetic entry (mirroring the scale-up path) so this adopted
+		// machine is counted in `current` without a re-List that a stale cache
+		// might not yet reflect. Zero ResourceVersion makes the sync loop skip it.
+		existing = append(existing, api.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: machineID, Namespace: cluster.Namespace},
+		})
+		r.eventf(cluster, corev1.EventTypeNormal, "MachineAdopted",
+			"Adopted pre-existing Omni binding %s into %s", machineID, machineSetID)
+	}
+
 	// Every machine that already has an object (even one mid-deletion) is
 	// claimed, so it is never re-selected for another set this reconcile.
 	var active []api.Machine
@@ -474,6 +511,21 @@ func (r *OmniClusterReconciler) reconcileMachineSetAllocation(
 		// ── Scale down ────────────────────────────────────────────────────────
 		toRemove := current - desired
 
+		// Order removal candidates unhealthy-first (not connected / not ready),
+		// ties broken by name for determinism, so scale-down sheds the safest
+		// machines first. Health missing from Omni counts as unhealthy.
+		health, err := r.OmniClient.MachineSetNodeHealth(ctx, machineSetID)
+		if err != nil {
+			return nil, fmt.Errorf("machine health for %s: %w", machineSetID, err)
+		}
+		sort.SliceStable(active, func(i, j int) bool {
+			hi, hj := machineHealthy(health, active[i].Name), machineHealthy(health, active[j].Name)
+			if hi != hj {
+				return !hi // unhealthy (false) sorts before healthy (true)
+			}
+			return active[i].Name < active[j].Name
+		})
+
 		if role == roleControlPlane {
 			if desired < 1 {
 				return nil, fmt.Errorf("control plane cannot scale below 1 replica")
@@ -493,11 +545,24 @@ func (r *OmniClusterReconciler) reconcileMachineSetAllocation(
 			case toRemove > 1:
 				toRemove = 1
 			}
+			// Refuse to auto-remove a healthy control-plane member. After the
+			// unhealthy-first sort, if the best candidate is still healthy then all
+			// members are healthy and the choice of which etcd member to drop is
+			// ambiguous — removing one unattended risks quorum. Leave it to an
+			// operator and requeue via the periodic RequeueAfter.
+			if toRemove > 0 && machineHealthy(health, active[0].Name) {
+				log.FromContext(ctx).Info("WARNING: control plane over-allocated but all members healthy; refusing to auto-remove an etcd member",
+					"set", machineSetID, "current", current, "desired", desired)
+				r.eventf(cluster, corev1.EventTypeWarning, "ControlPlaneOverAllocated",
+					"Control plane %s has %d members but desires %d; all are healthy, so removing one unattended risks etcd quorum — remove a member manually",
+					machineSetID, current, desired)
+				toRemove = 0
+			}
 		}
 
 		if toRemove > 0 {
-			evict := active[len(active)-toRemove:]
-			active = active[:len(active)-toRemove]
+			evict := active[:toRemove]
+			active = active[toRemove:]
 			for i := range evict {
 				if err := r.deleteMachine(ctx, &evict[i]); err != nil {
 					return nil, fmt.Errorf("evict machine %s from %s: %w", evict[i].Name, machineSetID, err)
@@ -991,6 +1056,14 @@ func desiredMachineSpec(clusterName, machineSetID, role string, spec api.Machine
 		ConfigPatches: spec.ConfigPatches,
 		KernelArgs:    spec.KernelArgs,
 	}
+}
+
+// machineHealthy reports whether a machine is both connected and cluster-ready
+// per Omni. A machine absent from the health map (no Omni status yet) is treated
+// as unhealthy, making it a preferred scale-down candidate.
+func machineHealthy(health map[string]MachineHealth, id string) bool {
+	h, ok := health[id]
+	return ok && h.Connected && h.Ready
 }
 
 // anyRebootInFlight reports whether any machine has a reboot owed (requested but

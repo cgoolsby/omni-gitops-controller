@@ -2,11 +2,14 @@ apiVersion: v2
 name: omni-gitops-controller
 description: Kubernetes operator that bridges Siderolabs Omni with Flux CD (and ArgoCD).
 type: application
-# Placeholder values. The real chart version and appVersion are stamped from the
-# git tag by .github/workflows/release.yml at package time (see the "Update Helm
-# chart appVersion" step), so these are intentionally not bumped per release.
-version: 0.0.0
-appVersion: "0.0.0"
+# These carry a real per-release semver so consumers that build the chart straight
+# from the git tree (e.g. a Flux GitRepository pinned at a ref.tag) see a distinct
+# chart version each release and don't serve a stale cached chart — GitRepository/
+# HelmChart consumers dedup by chart version. CI (.github/workflows/release.yml,
+# the "Update Helm chart appVersion" step) still overwrites both from the git tag
+# at package time, so bump these to the version being tagged next.
+version: 0.3.2
+appVersion: "0.3.2"
 keywords:
   - omni
   - talos

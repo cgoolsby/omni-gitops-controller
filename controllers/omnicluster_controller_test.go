@@ -454,6 +454,183 @@ func TestReconcileMachineSetAllocation_EmitsMachinesAllocatedEvent(t *testing.T)
 	}
 }
 
+// seedMachineSetNodeHealth inserts the Omni status fixtures that
+// MachineSetNodeHealth reads: a ClusterMachineStatus (labelled with the machine
+// set, carrying stage/ready) and a MachineStatus (carrying the connected flag).
+func seedMachineSetNodeHealth(ctx context.Context, t *testing.T, st state.State, machineSetID, machineID string, connected, ready bool) {
+	t.Helper()
+	cms := omnires.NewClusterMachineStatus(machineID)
+	cms.Metadata().Labels().Set(omnires.LabelMachineSet, machineSetID)
+	spec := cms.TypedSpec().Value
+	if ready {
+		spec.Stage = omniSpecs.ClusterMachineStatusSpec_RUNNING
+		spec.Ready = true
+	}
+	if err := st.Create(ctx, cms); err != nil {
+		t.Fatalf("create ClusterMachineStatus %s: %v", machineID, err)
+	}
+	ms := omnires.NewMachineStatus(machineID)
+	ms.TypedSpec().Value.Connected = connected
+	if err := st.Create(ctx, ms); err != nil {
+		t.Fatalf("create MachineStatus %s: %v", machineID, err)
+	}
+}
+
+// TestReconcileMachineSetAllocation_AdoptsPreexistingBinding is the regression
+// test for the v0.3.0/v0.3.1 double-bind: a cluster created before the Machine
+// CRD existed has a live Omni MachineSetNode but zero Machine objects. Allocation
+// must adopt that binding (front it with a Machine of the SAME UUID) rather than
+// read current=0 and scale up a second machine — and it must NOT create a second
+// MachineSetNode.
+func TestReconcileMachineSetAllocation_AdoptsPreexistingBinding(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := omnires.ControlPlanesResourceID(clusterName)
+	const boundUUID = "cp-uuid-live"
+
+	// Pre-existing Omni binding, no Machine object (the pre-CRD world).
+	if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, boundUUID, omnires.LabelControlPlaneRole); err != nil {
+		t.Fatalf("seed machine set node: %v", err)
+	}
+	// A spare available machine that a buggy scale-up would grab instead.
+	createMachineStatus(ctx, t, st, "cp-uuid-spare", true, nil)
+
+	r := newAllocReconciler(t, c)
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "default"}}
+
+	allocated, err := r.reconcileMachineSetAllocation(ctx, cluster, clusterName, machineSetID, roleControlPlane,
+		api.MachineSetSpec{Replicas: 1}, map[string]bool{})
+	if err != nil {
+		t.Fatalf("reconcileMachineSetAllocation: %v", err)
+	}
+
+	if len(allocated) != 1 || allocated[0] != boundUUID {
+		t.Fatalf("expected allocated == [%s], got %v", boundUUID, allocated)
+	}
+
+	list := &api.MachineList{}
+	if err := r.List(ctx, list); err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("expected exactly 1 Machine object (the adopted one), got %d", len(list.Items))
+	}
+	if list.Items[0].Name != boundUUID {
+		t.Errorf("adopted Machine has UUID %q, want %q", list.Items[0].Name, boundUUID)
+	}
+
+	// No SECOND MachineSetNode: the binding count is still 1 and still the live UUID.
+	nodes, err := c.AllocatedMachineSetNodes(ctx, machineSetID)
+	if err != nil {
+		t.Fatalf("list machine set nodes: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0] != boundUUID {
+		t.Errorf("expected exactly the pre-existing binding [%s], got %v", boundUUID, nodes)
+	}
+}
+
+// TestReconcileMachineSetAllocation_OverAllocatedRemovesUnhealthy verifies that
+// when adoption leaves a control plane over-allocated (2 bound, desired 1), the
+// not-connected / not-ready member is the one removed.
+func TestReconcileMachineSetAllocation_OverAllocatedRemovesUnhealthy(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := omnires.ControlPlanesResourceID(clusterName)
+	const healthyUUID = "cp-uuid-healthy"
+	const brokenUUID = "cp-uuid-broken"
+
+	for _, id := range []string{healthyUUID, brokenUUID} {
+		if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, id, omnires.LabelControlPlaneRole); err != nil {
+			t.Fatalf("seed machine set node %s: %v", id, err)
+		}
+	}
+	seedMachineSetNodeHealth(ctx, t, st, machineSetID, healthyUUID, true, true)
+	seedMachineSetNodeHealth(ctx, t, st, machineSetID, brokenUUID, false, false)
+
+	r := newAllocReconciler(t, c)
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "default"}}
+
+	allocated, err := r.reconcileMachineSetAllocation(ctx, cluster, clusterName, machineSetID, roleControlPlane,
+		api.MachineSetSpec{Replicas: 1}, map[string]bool{})
+	if err != nil {
+		t.Fatalf("reconcileMachineSetAllocation: %v", err)
+	}
+
+	if len(allocated) != 1 || allocated[0] != healthyUUID {
+		t.Fatalf("expected the unhealthy member removed, allocated == [%s], got %v", healthyUUID, allocated)
+	}
+	// The broken Machine object is deleted (no finalizer in the fake client).
+	remaining := &api.MachineList{}
+	if err := r.List(ctx, remaining); err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(remaining.Items) != 1 || remaining.Items[0].Name != healthyUUID {
+		t.Errorf("expected only %s to remain, got %+v", healthyUUID, remaining.Items)
+	}
+}
+
+// TestReconcileMachineSetAllocation_OverAllocatedAllHealthyRefuses verifies that
+// when a control plane is over-allocated but every member is healthy, no member
+// is auto-removed (the choice is left to an operator) and a Warning event fires.
+func TestReconcileMachineSetAllocation_OverAllocatedAllHealthyRefuses(t *testing.T) {
+	ctx := context.Background()
+	st := newTestState()
+	c := newTestOmniClient(st)
+
+	clusterName := "test-cluster"
+	machineSetID := omnires.ControlPlanesResourceID(clusterName)
+	ids := []string{"cp-uuid-a", "cp-uuid-b"}
+	for _, id := range ids {
+		if err := c.EnsureMachineSetNode(ctx, clusterName, machineSetID, id, omnires.LabelControlPlaneRole); err != nil {
+			t.Fatalf("seed machine set node %s: %v", id, err)
+		}
+		seedMachineSetNodeHealth(ctx, t, st, machineSetID, id, true, true)
+	}
+
+	r := newAllocReconciler(t, c)
+	r.Recorder = events.NewFakeRecorder(10)
+	cluster := &api.OmniCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: "default"}}
+
+	allocated, err := r.reconcileMachineSetAllocation(ctx, cluster, clusterName, machineSetID, roleControlPlane,
+		api.MachineSetSpec{Replicas: 1}, map[string]bool{})
+	if err != nil {
+		t.Fatalf("reconcileMachineSetAllocation: %v", err)
+	}
+
+	if len(allocated) != 2 {
+		t.Fatalf("expected both healthy members kept, got %v", allocated)
+	}
+	remaining := &api.MachineList{}
+	if err := r.List(ctx, remaining); err != nil {
+		t.Fatalf("list machines: %v", err)
+	}
+	if len(remaining.Items) != 2 {
+		t.Errorf("expected 2 Machine objects to remain (nothing auto-removed), got %d", len(remaining.Items))
+	}
+
+	recorder := r.Recorder.(*events.FakeRecorder)
+	found := false
+	for draining := true; draining; {
+		select {
+		case ev := <-recorder.Events:
+			if strings.Contains(ev, "ControlPlaneOverAllocated") {
+				found = true
+			}
+		default:
+			draining = false
+		}
+	}
+	if !found {
+		t.Error("expected a ControlPlaneOverAllocated Warning event, got none")
+	}
+}
+
 // ── deleteOmniResources tests ──────────────────────────────────────────────────
 
 // TestDeleteOmniResources_DeletesKubeconfigSecrets verifies that deleting an

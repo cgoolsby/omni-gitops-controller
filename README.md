@@ -95,8 +95,8 @@ machines in Omni.
 
 - **Complexity:** CAPI requires 3–5 separate controllers (core, bootstrap, infrastructure,
   control-plane) and a hierarchy of CRDs (`Cluster`, `Machine`, `MachineSet`,
-  `BootstrapConfig`, `InfrastructureMachine`, etc.). This controller is a single binary,
-  one CRD, and ~600 lines of Go.
+  `BootstrapConfig`, `InfrastructureMachine`, etc.). This controller is a single binary
+  with two reconcilers, two CRDs (`OmniCluster` and `Machine`), and ~1,700 lines of Go.
 - **No native Omni backend:** Using CAPI with Talos requires `cluster-api-provider-talos`,
   which provisions machines directly via `talosctl`. It bypasses Omni entirely, so Omni is
   not the source of truth for machine inventory or lifecycle.

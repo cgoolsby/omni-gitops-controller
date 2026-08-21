@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
@@ -259,9 +260,6 @@ func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.Lab
 
 	var ids []string
 	list.ForEach(func(ms *omnires.MachineStatus) {
-		if len(ids) >= count {
-			return
-		}
 		// Re-check the full selector client-side: the COSI push-down above is a
 		// narrowing optimisation, and this keeps Kubernetes label-selector
 		// semantics authoritative (e.g. a machine lacking the key matches NotIn
@@ -270,6 +268,14 @@ func (c *OmniClient) SelectAvailableMachines(ctx context.Context, sel metav1.Lab
 			ids = append(ids, ms.Metadata().ID())
 		}
 	})
+
+	// Sort before truncating so selection is deterministic: two equally-matching
+	// machines always resolve the same way, and a controller restart does not
+	// thrash between equivalent candidates.
+	sort.Strings(ids)
+	if len(ids) > count {
+		ids = ids[:count]
+	}
 	return ids, nil
 }
 
@@ -304,6 +310,57 @@ func (c *OmniClient) AllocatedMachineSetNodes(ctx context.Context, machineSetID 
 		ids = append(ids, n.Metadata().ID())
 	})
 	return ids, nil
+}
+
+// MachineHealth captures the runtime health signals used to order scale-down:
+// whether the machine is currently connected to Omni and whether it has joined
+// the cluster and is running+ready. A machine missing from Omni's status
+// resources reports both false (i.e. unhealthy) and is a preferred removal
+// candidate.
+type MachineHealth struct {
+	Connected bool
+	Ready     bool
+}
+
+// MachineSetNodeHealth returns per-UUID health for the machines currently bound
+// to a MachineSet, so scale-down can prefer removing not-connected / not-ready
+// machines before healthy ones. Readiness comes from ClusterMachineStatus (the
+// cluster-membership view: RUNNING and Ready), connectivity from MachineStatus
+// (the Connected field). Both are keyed by the machine UUID.
+func (c *OmniClient) MachineSetNodeHealth(ctx context.Context, machineSetID string) (map[string]MachineHealth, error) {
+	health := map[string]MachineHealth{}
+
+	cmsList, err := safe.StateListAll[*omnires.ClusterMachineStatus](ctx, c.state,
+		state.WithLabelQuery(resource.LabelEqual(omnires.LabelMachineSet, machineSetID)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list cluster machine statuses for %s: %w", machineSetID, err)
+	}
+	cmsList.ForEach(func(cms *omnires.ClusterMachineStatus) {
+		id := cms.Metadata().ID()
+		spec := cms.TypedSpec().Value
+		h := health[id]
+		h.Ready = spec.Ready && spec.Stage == omniSpecs.ClusterMachineStatusSpec_RUNNING
+		health[id] = h
+	})
+
+	// Connectivity is on MachineStatus (per-UUID). Fetch it directly rather than
+	// relying on MachineStatus carrying the machine-set label; a not-found status
+	// leaves Connected false (unhealthy), which is the safe scale-down default.
+	for id := range health {
+		ms, err := safe.StateGet[*omnires.MachineStatus](ctx, c.state, omnires.NewMachineStatus(id).Metadata())
+		if err != nil {
+			if state.IsNotFoundError(err) {
+				continue
+			}
+			return nil, fmt.Errorf("get machine status %s: %w", id, err)
+		}
+		h := health[id]
+		h.Connected = ms.TypedSpec().Value.Connected
+		health[id] = h
+	}
+
+	return health, nil
 }
 
 // EnsureMachineSetNode binds a machine to a MachineSet in Omni.

@@ -83,8 +83,11 @@ tests, visible only as ERROR logs in a real cluster.
 
 - Tag `vX.Y.Z` → `.github/workflows/release.yml` builds/pushes the image, cosign-signs
   it, attaches an SBOM, packages+pushes the Helm chart, and cuts a GitHub Release.
-- `Chart.yaml` `version`/`appVersion` are placeholders (`0.0.0`); CI stamps the real
-  values from the tag. Do not bump them per release by hand.
+- `Chart.yaml` `version`/`appVersion` carry a real per-release semver in the tree, and
+  CI (`release.yml`) re-stamps both from the tag at package time. Bump them to the
+  version you are about to tag **before** tagging: consumers that build the chart from
+  the git tree (below) dedup by chart version, so a stale in-tree `version` makes them
+  serve a cached chart across releases even though the templates changed.
 - Downstream consumers may pin the chart via a Flux `GitRepository` at a `ref.tag` and
   build the chart straight from the git tree — so a chart-template fix propagates via
   the tag, but consumers must move their `ref.tag` to pick it up.
